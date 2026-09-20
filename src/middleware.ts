@@ -177,6 +177,11 @@ function shouldSkipAuth(pathname: string): boolean {
     '/screenshot.png',
   ];
 
+  // 允许公开访问本地直播频道列表（.m3u），供直播源刷新拉取
+  if (pathname.endsWith('.m3u') || pathname.endsWith('.m3u8')) {
+    return true;
+  }
+
   return skipPaths.some((path) => pathname.startsWith(path));
 }
 
