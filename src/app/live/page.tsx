@@ -16,10 +16,19 @@ import {
   subscribeToDataUpdates,
 } from '@/lib/db.client';
 import { parseCustomTimeFormat } from '@/lib/time';
+import {
+  attachTeslaPassengerGuard,
+  fetchTeslaCanvasAvailability,
+  markUserInitiatedMediaPause,
+  shouldPreferTeslaCanvasPlayback,
+  type TeslaPlayerGuard,
+} from '@/lib/tesla';
 import { useLiveSync } from '@/hooks/useLiveSync';
 
 import EpgScrollableRow from '@/components/EpgScrollableRow';
 import PageLayout from '@/components/PageLayout';
+import TeslaCanvasPlayer from '@/components/TeslaCanvasPlayer';
+import { TeslaPassengerBar } from '@/components/TeslaModeBootstrap';
 
 // 扩展 HTMLVideoElement 类型以支持 hls 和 flv 属性
 declare global {
@@ -133,6 +142,7 @@ function LivePageClient() {
   const [videoUrl, setVideoUrl] = useState('');
   const [isVideoLoading, setIsVideoLoading] = useState(false);
   const [unsupportedType, setUnsupportedType] = useState<string | null>(null);
+  const [teslaCanvasActive, setTeslaCanvasActive] = useState(false);
 
   // 切换直播源状态
   const [isSwitchingSource, setIsSwitchingSource] = useState(false);
@@ -319,6 +329,7 @@ function LivePageClient() {
 
   // 播放器引用
   const artPlayerRef = useRef<any>(null);
+  const teslaGuardRef = useRef<TeslaPlayerGuard | null>(null);
   const artRef = useRef<HTMLDivElement | null>(null);
   const syncAnime4KCanvasFlip = (flip?: string) => {
     const canvas = anime4kRef.current?.canvas as HTMLCanvasElement | undefined;
@@ -1089,10 +1100,16 @@ function LivePageClient() {
     // 清理Anime4K
     cleanupAnime4K();
 
+    if (teslaGuardRef.current) {
+      teslaGuardRef.current.destroy();
+      teslaGuardRef.current = null;
+    }
+
     if (artPlayerRef.current) {
       try {
         // 先暂停播放
         if (artPlayerRef.current.video) {
+          markUserInitiatedMediaPause(artPlayerRef.current.video);
           artPlayerRef.current.video.pause();
           artPlayerRef.current.video.src = '';
           artPlayerRef.current.video.load();
@@ -1863,14 +1880,44 @@ function LivePageClient() {
 
   // 播放器初始化
   useEffect(() => {
+    let cancelled = false;
+    const refreshTeslaCanvasMode = async () => {
+      if (!shouldPreferTeslaCanvasPlayback()) {
+        if (!cancelled) setTeslaCanvasActive(false);
+        return;
+      }
+      const available = await fetchTeslaCanvasAvailability();
+      if (!cancelled) setTeslaCanvasActive(available);
+    };
+    void refreshTeslaCanvasMode();
+    const onMode = () => {
+      void refreshTeslaCanvasMode();
+    };
+    window.addEventListener('moontv:tesla-passenger-mode', onMode);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('moontv:tesla-passenger-mode', onMode);
+    };
+  }, []);
+
+  // 播放器初始化
+  useEffect(() => {
     const preload = async () => {
+      if (!videoUrl || !currentChannel) {
+        return;
+      }
+
+      if (teslaCanvasActive) {
+        cleanupPlayer();
+        setIsVideoLoading(false);
+        return;
+      }
+
       if (
         !Artplayer ||
         !Hls ||
         !flvjs ||
-        !videoUrl ||
-        !artRef.current ||
-        !currentChannel
+        !artRef.current
       ) {
         return;
       }
@@ -2077,6 +2124,12 @@ function LivePageClient() {
           setError(null);
           setIsVideoLoading(false);
 
+          if (teslaGuardRef.current) {
+            teslaGuardRef.current.destroy();
+          }
+          teslaGuardRef.current = attachTeslaPassengerGuard(artPlayerRef.current, {
+            preferWebFullscreen: true,
+          });
         });
 
         artPlayerRef.current.on('loadstart', () => {
@@ -2112,7 +2165,7 @@ function LivePageClient() {
       }
     }
     preload();
-  }, [Artplayer, Hls, videoUrl, currentChannel, loading]);
+  }, [Artplayer, Hls, videoUrl, currentChannel, loading, teslaCanvasActive]);
 
   // 清理播放器资源
   useEffect(() => {
@@ -2306,6 +2359,7 @@ function LivePageClient() {
 
   return (
     <PageLayout activePath='/live'>
+      <TeslaPassengerBar />
       <div className='flex flex-col gap-3 py-4 px-5 lg:px-[3rem] 2xl:px-20'>
         {/* 第一行：页面标题 */}
         <div className='py-1'>
@@ -2377,10 +2431,23 @@ function LivePageClient() {
             {/* 播放器 */}
             <div className={`h-full transition-all duration-300 ease-in-out ${isChannelListCollapsed ? 'col-span-1' : 'md:col-span-3'}`}>
               <div className='relative w-full h-[300px] lg:h-full'>
-                <div
-                  ref={artRef}
-                  className='bg-black w-full h-full rounded-xl overflow-hidden shadow-lg border border-white/0 dark:border-white/30'
-                ></div>
+                {teslaCanvasActive && videoUrl ? (
+                  <TeslaCanvasPlayer
+                    src={
+                      (currentSourceRef.current?.proxyMode || 'full') === 'direct'
+                        ? videoUrl
+                        : `/api/proxy/m3u8?url=${encodeURIComponent(videoUrl)}&moontv-source=${currentSourceRef.current?.key || ''}`
+                    }
+                    title={currentChannel?.name || currentSource?.name}
+                    isLive
+                    poster={currentChannel?.logo || undefined}
+                  />
+                ) : (
+                  <div
+                    ref={artRef}
+                    className='bg-black w-full h-full rounded-xl overflow-hidden shadow-lg border border-white/0 dark:border-white/30'
+                  ></div>
+                )}
 
                 {/* 不支持的直播类型提示 */}
                 {unsupportedType && (

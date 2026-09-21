@@ -17,6 +17,7 @@ import { DownloadPanel } from '../components/DownloadPanel';
 import { GlobalErrorIndicator } from '../components/GlobalErrorIndicator';
 import RouteScrollReset from '../components/RouteScrollReset';
 import { SiteProvider } from '../components/SiteProvider';
+import { TeslaModeBootstrap } from '../components/TeslaModeBootstrap';
 import { ThemeProvider } from '../components/ThemeProvider';
 import { TokenRefreshManager } from '../components/TokenRefreshManager';
 import TopProgressBar from '../components/TopProgressBar';
@@ -420,6 +421,7 @@ export default async function RootLayout({
           <TopProgressBar />
           <RouteScrollReset />
           <TokenRefreshManager />
+          <TeslaModeBootstrap />
           <SiteProvider
             siteName={siteName}
             announcement={announcement}

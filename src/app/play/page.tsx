@@ -48,6 +48,13 @@ import {
   saveSkipConfig,
   subscribeToDataUpdates,
 } from '@/lib/db.client';
+import {
+  attachTeslaPassengerGuard,
+  fetchTeslaCanvasAvailability,
+  markUserInitiatedMediaPause,
+  shouldPreferTeslaCanvasPlayback,
+  type TeslaPlayerGuard,
+} from '@/lib/tesla';
 import { getDoubanDetail } from '@/lib/douban.client';
 import { isEpisodeHiddenByFilter, normalizeEpisodeFilterConfig } from '@/lib/episode-filter';
 import { appendSpecialSourceParam, isSpecialSourcesEnabledOnDevice } from '@/lib/special-source.client';
@@ -89,6 +96,8 @@ import PansouSearch from '@/components/PansouSearch';
 import ProxyImage from '@/components/ProxyImage';
 import { useSite } from '@/components/SiteProvider';
 import SmartRecommendations from '@/components/SmartRecommendations';
+import TeslaCanvasPlayer from '@/components/TeslaCanvasPlayer';
+import { TeslaPassengerBar } from '@/components/TeslaModeBootstrap';
 import Toast, { ToastProps } from '@/components/Toast';
 import VideoCard from '@/components/VideoCard';
 
@@ -1607,6 +1616,8 @@ function PlayPageClient() {
   // 视频播放地址
   const [videoUrl, setVideoUrl] = useState('');
   const [playbackSourceBadge, setPlaybackSourceBadge] = useState<PlaybackSourceBadge>(null);
+  // Tesla D 档：系统冻结 <video> 画面时改用 ffmpeg+JSMpeg 画布播放
+  const [teslaCanvasActive, setTeslaCanvasActive] = useState(false);
 
   // 鸿蒙浏览器使用原生 HLS 时，video.currentSrc 会保留真实 m3u8，便于浏览器投屏。
   const [isHarmonyOS] = useState(
@@ -2085,6 +2096,7 @@ function PlayPageClient() {
   const nextEpisodeDanmakuPreloadTriggeredRef = useRef<boolean>(false);
 
   const artPlayerRef = useRef<any>(null);
+  const teslaGuardRef = useRef<TeslaPlayerGuard | null>(null);
   const artRef = useRef<HTMLDivElement | null>(null);
   const activeHarmonyHlsPlaybackModeRef =
     useRef<HarmonyHlsPlaybackMode | null>(null);
@@ -4128,8 +4140,16 @@ function PlayPageClient() {
     // 先清理Anime4K，避免GPU纹理错误
     await cleanupAnime4K();
 
+    if (teslaGuardRef.current) {
+      teslaGuardRef.current.destroy();
+      teslaGuardRef.current = null;
+    }
+
     if (artPlayerRef.current) {
       try {
+        if (artPlayerRef.current.video) {
+          markUserInitiatedMediaPause(artPlayerRef.current.video);
+        }
         // 在销毁前先移除弹幕显示/隐藏事件监听器，避免 destroy 时触发 hide 事件导致状态被错误保存
         if (artPlayerRef.current) {
           artPlayerRef.current.off('artplayerPluginDanmuku:show');
@@ -6892,12 +6912,46 @@ function PlayPageClient() {
   };
 
   useEffect(() => {
+    let cancelled = false;
+
+    const refreshTeslaCanvasMode = async () => {
+      if (!shouldPreferTeslaCanvasPlayback()) {
+        if (!cancelled) setTeslaCanvasActive(false);
+        return;
+      }
+      const available = await fetchTeslaCanvasAvailability();
+      if (!cancelled) {
+        setTeslaCanvasActive(available);
+      }
+    };
+
+    void refreshTeslaCanvasMode();
+    const onMode = () => {
+      void refreshTeslaCanvasMode();
+    };
+    window.addEventListener('moontv:tesla-passenger-mode', onMode);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('moontv:tesla-passenger-mode', onMode);
+    };
+  }, []);
+
+  useEffect(() => {
     if (
       !videoUrl ||
       loading ||
-      currentEpisodeIndex === null ||
-      !artRef.current
+      currentEpisodeIndex === null
     ) {
+      return;
+    }
+
+    // Tesla 画布模式：不创建 Artplayer，避免被系统冻结的 video 抢占
+    if (teslaCanvasActive) {
+      void cleanupPlayer();
+      return;
+    }
+
+    if (!artRef.current) {
       return;
     }
 
@@ -8417,6 +8471,13 @@ function PlayPageClient() {
         artPlayerRef.current.on('ready', async () => {
           setError(null);
 
+          if (teslaGuardRef.current) {
+            teslaGuardRef.current.destroy();
+          }
+          teslaGuardRef.current = attachTeslaPassengerGuard(artPlayerRef.current, {
+            preferWebFullscreen: true,
+          });
+
           rescueWebkitHlsBootstrap('player-ready');
 
           // 标记播放器已就绪，触发 usePlaySync 设置事件监听器
@@ -9846,6 +9907,7 @@ function PlayPageClient() {
     harmonyHlsPlaybackMode,
     nativeHlsAdBlockEnabled,
     netdiskHlsPlaybackMode,
+    teslaCanvasActive,
   ]);
 
   // 当组件卸载时清理定时器、Wake Lock 和播放器资源
@@ -10070,6 +10132,7 @@ function PlayPageClient() {
 
   return (
     <PageLayout activePath='/play' hideNavigation={isWebFullscreen}>
+      <TeslaPassengerBar />
       {/* TMDB背景图 */}
       {tmdbBackdrop && (
         <div
@@ -10309,10 +10372,20 @@ function PlayPageClient() {
             >
               {/* 播放器容器 */}
               <div className='relative w-full h-[300px] lg:flex-1 lg:min-h-0'>
-                <div
-                  ref={artRef}
-                  className='bg-black w-full h-full rounded-xl overflow-hidden shadow-lg'
-                ></div>
+                {teslaCanvasActive && videoUrl ? (
+                  <TeslaCanvasPlayer
+                    src={videoUrl}
+                    title={videoTitle || undefined}
+                    isLive={false}
+                    poster={videoCover || undefined}
+                    onError={(message) => setError(message)}
+                  />
+                ) : (
+                  <div
+                    ref={artRef}
+                    className='bg-black w-full h-full rounded-xl overflow-hidden shadow-lg'
+                  ></div>
+                )}
 
                 {/* 换源加载蒙层 */}
                 {(isVideoLoading || videoError) && (

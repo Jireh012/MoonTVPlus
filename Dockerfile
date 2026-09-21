@@ -37,8 +37,8 @@ FROM node:24-alpine AS runner
 # 启用 corepack 并激活 pnpm（用于安装额外依赖）
 RUN corepack enable && corepack prepare pnpm@latest --activate
 
-# 安装 su-exec，用于在 entrypoint 中降权运行
-RUN apk add --no-cache su-exec
+# 安装 su-exec（entrypoint 降权）和 ffmpeg（Tesla 画布转码：mpeg1video + libmp3lame）
+RUN apk add --no-cache su-exec ffmpeg
 
 # 创建非 root 用户
 RUN addgroup -g 1001 -S nodejs && adduser -u 1001 -S nextjs -G nodejs
@@ -54,6 +54,7 @@ ENV PORT=3000
 ENV DOCKER_ENV=true
 ENV SQLITE_DB_PATH=/app/.data/moontv.db
 ENV OFFLINE_DOWNLOAD_DIR=/data
+ENV FFMPEG_PATH=/usr/bin/ffmpeg
 
 # 从构建器中复制 standalone 输出
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./

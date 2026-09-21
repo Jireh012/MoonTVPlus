@@ -74,3 +74,15 @@ scripts/test
 
 .agents/
 skills-lock.json
+
+# Android / Gradle build cache
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+.cxx/
+captures/

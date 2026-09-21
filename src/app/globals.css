@@ -334,3 +334,33 @@ div[data-media-provider] video {
     transition: none;
   }
 }
+
+/* Tesla 车机浏览器优化 */
+html.tesla-browser {
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+html.tesla-browser .art-video-player .art-controls,
+html.tesla-browser .art-video-player .art-bottom {
+  font-size: 16px;
+}
+
+html.tesla-browser .art-video-player .art-control,
+html.tesla-browser .art-video-player .art-state {
+  min-width: 48px;
+  min-height: 48px;
+}
+
+html.tesla-browser .art-video-player .art-progress {
+  height: 10px !important;
+}
+
+html.tesla-passenger-mode video {
+  /* 降低被系统识别为「剧院视频」的概率，尽量保持乘客可看 */
+  transform: translateZ(0);
+}
+
+html.tesla-browser body {
+  overscroll-behavior: none;
+}

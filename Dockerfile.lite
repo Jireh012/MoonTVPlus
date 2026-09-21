@@ -28,8 +28,8 @@ RUN pnpm run build
 # ---- 第 3 阶段：生成 lite 运行时镜像 ----
 FROM node:24-alpine AS runner
 
-# 安装 su-exec，用于在 entrypoint 中降权运行
-RUN apk add --no-cache su-exec
+# 安装 su-exec（entrypoint 降权）和 ffmpeg（Tesla 画布转码）
+RUN apk add --no-cache su-exec ffmpeg
 
 RUN addgroup -g 1001 -S nodejs && adduser -u 1001 -S nextjs -G nodejs
 
@@ -46,6 +46,7 @@ ENV MOONTV_LITE=true
 ENV WATCH_ROOM_ENABLED=false
 ENV WATCH_ROOM_SERVER_TYPE=external
 ENV OFFLINE_DOWNLOAD_DIR=/data
+ENV FFMPEG_PATH=/usr/bin/ffmpeg
 
 # standalone 输出自带运行所需的最小服务端依赖
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./

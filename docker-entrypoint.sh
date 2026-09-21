@@ -23,6 +23,14 @@ fix_owner() {
   fi
 }
 
+# 部署兜底：镜像未预装 ffmpeg 时，root 启动阶段补装（Alpine）
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  if [ "$(id -u)" = "0" ] && command -v apk >/dev/null 2>&1; then
+    echo "docker-entrypoint: ffmpeg missing, installing..."
+    apk add --no-cache ffmpeg || echo "docker-entrypoint: ffmpeg install failed"
+  fi
+fi
+
 if [ "$(id -u)" = "0" ]; then
   echo "docker-entrypoint: adjusting UID=${PUID} GID=${PGID}"
 
