@@ -6930,9 +6930,11 @@ function PlayPageClient() {
       void refreshTeslaCanvasMode();
     };
     window.addEventListener('moontv:tesla-passenger-mode', onMode);
+    window.addEventListener('moontv:tesla-playback-mode', onMode);
     return () => {
       cancelled = true;
       window.removeEventListener('moontv:tesla-passenger-mode', onMode);
+      window.removeEventListener('moontv:tesla-playback-mode', onMode);
     };
   }, []);
 

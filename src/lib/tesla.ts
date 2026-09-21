@@ -270,6 +270,11 @@ export function shouldPreferTeslaCanvasPlayback(): boolean {
 }
 
 export async function fetchTeslaCanvasAvailability(): Promise<boolean> {
+  // 高清 WebCodecs 模式直接解 HLS 原流，不依赖服务端 ffmpeg，
+  // 同样能绕过 D 档对 <video> 的画面冻结。
+  if (getTeslaPlaybackMode() === 'webcodecs' && isTeslaWebCodecsSupported()) {
+    return true;
+  }
   try {
     const response = await fetch('/api/tesla/status', {
       credentials: 'same-origin',

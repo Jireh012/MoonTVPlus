@@ -167,6 +167,14 @@ export default function TeslaCanvasPlayer({
 
   useEffect(() => {
     let cancelled = false;
+    // JSMpeg 兼容模式的渲染循环定时器（见 start 内的接管逻辑）
+    let jsmpegLoopTimer: number | null = null;
+    const stopJsmpegLoop = () => {
+      if (jsmpegLoopTimer != null) {
+        window.clearInterval(jsmpegLoopTimer);
+        jsmpegLoopTimer = null;
+      }
+    };
 
     const start = async () => {
       cleanup();
@@ -261,6 +269,61 @@ export default function TeslaCanvasPlayer({
           // ignore
         }
         player.volume = muted ? 0 : 1;
+
+        // 关键修复：Tesla D 档会冻结页面的 requestAnimationFrame。
+        // JSMpeg 的渲染循环用 rAF 重排自己（play → rAF(update)，update 每帧再排 rAF），
+        // 冻结后 update 停摆，画布永远停在最后一帧（音频走 WebAudio 所以还在响）。
+        // 这里接管为 setInterval 驱动，绕过 rAF。
+        stopJsmpegLoop();
+        const cancelPendingRaf = () => {
+          if (player.animationId) {
+            try {
+              window.cancelAnimationFrame(player.animationId);
+            } catch {
+              // ignore
+            }
+            player.animationId = null;
+          }
+        };
+        const originalUpdate = player.update.bind(player);
+        player.update = () => {
+          // 屏蔽 update 内部对 requestAnimationFrame 的重排
+          const raf = window.requestAnimationFrame;
+          const caf = window.cancelAnimationFrame;
+          (window as any).requestAnimationFrame = () => 0;
+          (window as any).cancelAnimationFrame = () => undefined;
+          try {
+            originalUpdate();
+          } finally {
+            window.requestAnimationFrame = raf;
+            window.cancelAnimationFrame = caf;
+          }
+        };
+        const originalPlay = player.play.bind(player);
+        player.play = () => {
+          player.animationId = null; // 避免 play 因残留 animationId 提前返回
+          originalPlay();
+          cancelPendingRaf(); // originalPlay 会再排一个（可能被冻结的）rAF，撤掉
+          if (jsmpegLoopTimer == null) {
+            jsmpegLoopTimer = window.setInterval(() => {
+              if (player.paused || !player.wantsToPlay) return;
+              try {
+                player.update();
+              } catch {
+                // ignore
+              }
+            }, 16);
+          }
+        };
+        const originalPause = player.pause.bind(player);
+        player.pause = () => {
+          originalPause();
+          cancelPendingRaf();
+          stopJsmpegLoop();
+        };
+        // streaming 模式下构造函数会自动 play()，先撤掉那个 rAF 并启动 setInterval 循环
+        cancelPendingRaf();
+        player.play();
         playerRef.current = player;
 
       } catch (err) {
@@ -277,6 +340,7 @@ export default function TeslaCanvasPlayer({
     void start();
     return () => {
       cancelled = true;
+      stopJsmpegLoop();
       cleanup();
     };
     // muted 不重拉流，仅在按钮里改 audio.muted
