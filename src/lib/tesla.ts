@@ -2,7 +2,20 @@ const TESLA_PASSENGER_MODE_KEY = 'moontv_tesla_passenger_mode';
 const TESLA_PLAYBACK_MODE_KEY = 'moontv_tesla_playback_mode';
 const TESLA_FORCE_KEY = 'moontv_force_tesla';
 
+/**
+ * 旧车机 UA 带 Tesla / QtCarBrowser。
+ * 2026.20 的 Model Y 浏览器不再附带这些字样，只保留未精简的 Chromium 构建号
+ * Chrome/140.0.7339.x。桌面 Chrome 在 Linux 上会报 Chrome/140.0.0.0。
+ */
+const TESLA_BROWSER_UA = /Tesla|QtCarBrowser|TeslaBrowser/i;
+const TESLA_CHROMIUM_BUILD_UA =
+  /X11;\s*Linux[^)]*\)[\s\S]*Chrome\/140\.0\.7339\.\d+/i;
+
 export type TeslaPlaybackMode = 'compat' | 'webcodecs';
+
+export function isTeslaUserAgent(userAgent: string): boolean {
+  return TESLA_BROWSER_UA.test(userAgent) || TESLA_CHROMIUM_BUILD_UA.test(userAgent);
+}
 
 let prototypePatched = false;
 let originalPause: (() => void) | null = null;
@@ -21,7 +34,7 @@ export function isTeslaBrowser(userAgent?: string): boolean {
   }
   const ua = userAgent || (typeof navigator !== 'undefined' ? navigator.userAgent : '');
   if (!ua) return false;
-  return /Tesla/i.test(ua) || /QtCarBrowser/i.test(ua) || /TeslaBrowser/i.test(ua);
+  return isTeslaUserAgent(ua);
 }
 
 export function getTeslaPassengerMode(): boolean {
