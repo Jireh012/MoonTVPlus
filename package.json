@@ -128,5 +128,8 @@
     "vercel": "^50.4.10",
     "webpack-obfuscator": "^3.5.1"
   },
-  "packageManager": "pnpm@10.14.0"
+  "packageManager": "pnpm@10.14.0",
+  "pnpm": {
+    "onlyBuiltDependencies": ["better-sqlite3"]
+  }
 }

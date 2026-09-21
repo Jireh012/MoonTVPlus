@@ -29,7 +29,8 @@ RUN pnpm run build
 FROM node:24-alpine AS runner
 
 # 安装 su-exec（entrypoint 降权）和 ffmpeg（Tesla 画布转码）
-RUN apk add --no-cache su-exec ffmpeg
+RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.cloud.tencent.com#g' /etc/apk/repositories \
+ && apk add --no-cache su-exec ffmpeg
 
 RUN addgroup -g 1001 -S nodejs && adduser -u 1001 -S nextjs -G nodejs
 
