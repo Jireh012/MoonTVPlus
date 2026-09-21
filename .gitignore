@@ -86,3 +86,6 @@ local.properties
 *.class
 .cxx/
 captures/
+
+# WorkBuddy workspace data
+.workbuddy/

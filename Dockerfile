@@ -28,6 +28,10 @@ ENV DOCKER_ENV=true
 # 生成生产构建
 RUN pnpm run build
 
+# better-sqlite3 在 pnpm deploy 时需要编译
+RUN sed -i 's#https://dl-cdn.alpinelinux.org#https://mirrors.cloud.tencent.com#g' /etc/apk/repositories \
+ && apk add --no-cache python3 make g++
+
 # 使用 pnpm deploy 提取生产依赖到独立目录
 RUN pnpm deploy --filter=. --prod --legacy /tmp/prod-deps
 
