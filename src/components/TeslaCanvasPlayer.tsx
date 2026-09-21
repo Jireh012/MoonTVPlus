@@ -3,6 +3,9 @@
 import { Loader2, Pause, Play, Volume2, VolumeX } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { getTeslaPlaybackMode, type TeslaPlaybackMode } from '@/lib/tesla';
+import { startTeslaWebCodecs } from '@/lib/tesla-webcodecs';
+
 declare global {
   interface Window {
     JSMpeg?: any;
@@ -133,6 +136,19 @@ export default function TeslaCanvasPlayer({
   const [playing, setPlaying] = useState(true);
   const [muted, setMuted] = useState(false);
   const [error, setError] = useState('');
+  const [playbackMode, setPlaybackMode] = useState<TeslaPlaybackMode>(() =>
+    getTeslaPlaybackMode()
+  );
+
+  useEffect(() => {
+    setPlaybackMode(getTeslaPlaybackMode());
+    const onMode = (event: Event) => {
+      const mode = (event as CustomEvent).detail?.mode;
+      setPlaybackMode(mode === 'webcodecs' ? 'webcodecs' : 'compat');
+    };
+    window.addEventListener('moontv:tesla-playback-mode', onMode);
+    return () => window.removeEventListener('moontv:tesla-playback-mode', onMode);
+  }, []);
 
   const cleanup = useCallback(() => {
     try {
@@ -161,20 +177,47 @@ export default function TeslaCanvasPlayer({
       if (!src || !canvasRef.current) return;
 
       try {
+        const audioApi = `/api/tesla/audio?url=${encodeURIComponent(src)}`;
+        const audio = audioRef.current;
+        if (playbackMode === 'webcodecs' && audio) {
+          audio.src = audioApi;
+          audio.muted = muted;
+        }
+
+        if (playbackMode === 'webcodecs') {
+          const player = startTeslaWebCodecs({
+            src,
+            canvas: canvasRef.current,
+            audio: audioRef.current,
+            onStarted: () => {
+              if (!cancelled) setLoading(false);
+            },
+            onError: (err) => {
+              if (!cancelled) {
+                setError(err.message);
+                setLoading(false);
+                onError?.(err.message);
+              }
+            },
+          });
+          playerRef.current = player;
+          return;
+        }
+
         const JSMpeg = await loadJSMpeg();
         if (cancelled || !canvasRef.current) return;
 
         const FetchStreamSource = createFetchStreamSource(JSMpeg);
         const videoApi = `/api/tesla/mpegts?url=${encodeURIComponent(src)}`;
-        const audioApi = `/api/tesla/audio?url=${encodeURIComponent(src)}`;
 
         const player = new JSMpeg.Player(videoApi, {
           canvas: canvasRef.current,
-          audio: false,
+          audio: true,
           streaming: true,
-          throttled: false,
-          disableGl: false,
-          videoBufferSize: 1024 * 1024 * 3,
+          pauseWhenHidden: false,
+          maxAudioLag: 1,
+          videoBufferSize: 1024 * 1024 * 2,
+          audioBufferSize: 128 * 1024,
           source: FetchStreamSource,
           onSourceEstablished: () => {
             if (!cancelled) setLoading(false);
@@ -189,18 +232,37 @@ export default function TeslaCanvasPlayer({
             }
           },
         });
+        // 直播默认每个刷新都解一帧，画面会快于声音。音频只留约 0.3 秒缓冲，画面追上播放位置后就停。
+        player.updateForStreaming = function updateForStreamingSynced(this: any) {
+          const audio = this.audio;
+          const audioOut = this.audioOut;
+          const video = this.video;
+          if (audio && audioOut) {
+            let packets = 0;
+            while (audioOut.enqueuedTime < 0.3 && packets < 8) {
+              if (!audio.decode()) break;
+              packets += 1;
+            }
+          }
+          if (video && audio?.canPlay) {
+            const audioTime = audio.currentTime || 0;
+            let frames = 0;
+            while (video.currentTime <= audioTime + 0.05 && frames < 4) {
+              if (!video.decode()) break;
+              frames += 1;
+            }
+            return;
+          }
+          video?.decode?.();
+        };
+        try {
+          player.audioOut?.unlock?.();
+        } catch {
+          // ignore
+        }
+        player.volume = muted ? 0 : 1;
         playerRef.current = player;
 
-        const audio = audioRef.current;
-        if (audio) {
-          audio.src = audioApi;
-          audio.muted = muted;
-          // 音频通常比画面多缓冲几秒，略微延迟启动减轻不同步
-          window.setTimeout(() => {
-            if (cancelled) return;
-            audio.play().catch(() => undefined);
-          }, 1800);
-        }
       } catch (err) {
         const message =
           err instanceof Error ? err.message : '初始化 Tesla 画布播放失败';
@@ -219,7 +281,7 @@ export default function TeslaCanvasPlayer({
     };
     // muted 不重拉流，仅在按钮里改 audio.muted
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [src, cleanup, onError]);
+  }, [src, cleanup, onError, playbackMode]);
 
   const togglePlay = () => {
     const player = playerRef.current;
@@ -249,6 +311,15 @@ export default function TeslaCanvasPlayer({
     const audio = audioRef.current;
     const next = !muted;
     setMuted(next);
+    const player = playerRef.current;
+    if (playbackMode === 'compat' && player) {
+      try {
+        player.volume = next ? 0 : 1;
+      } catch {
+        // ignore
+      }
+      return;
+    }
     if (audio) audio.muted = next;
   };
 
@@ -263,10 +334,11 @@ export default function TeslaCanvasPlayer({
         />
       )}
       <canvas
+        key={playbackMode}
         ref={canvasRef}
         className='h-full w-full object-contain'
         width={960}
-        height={540}
+        height={544}
       />
       <audio ref={audioRef} preload='auto' playsInline />
 
@@ -280,7 +352,11 @@ export default function TeslaCanvasPlayer({
           ) : (
             <div className='flex items-center gap-3 text-white'>
               <Loader2 className='h-6 w-6 animate-spin text-emerald-400' />
-              <span>正在转码为 Tesla 可用画面…</span>
+              <span>
+                {playbackMode === 'webcodecs'
+                  ? '正在用 WebCodecs 解码原画…'
+                  : '正在转码为 Tesla 可用画面…'}
+              </span>
             </div>
           )}
         </div>
@@ -309,7 +385,7 @@ export default function TeslaCanvasPlayer({
               {title || 'Tesla 乘客画布播放'}
             </div>
             <div className='text-xs text-emerald-300/90'>
-              {isLive ? '直播' : '点播'} · 系统冻结 video 时仍可看画面
+              {isLive ? '直播' : '点播'} · {playbackMode === 'webcodecs' ? '高清 WebCodecs' : '兼容转码'}
             </div>
           </div>
         </div>

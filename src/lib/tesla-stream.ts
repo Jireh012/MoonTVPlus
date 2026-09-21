@@ -1,5 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import { spawn, type ChildProcessByStdio } from 'child_process';
 import { existsSync } from 'fs';
+import type { Readable } from 'stream';
 
 const FFMPEG_CANDIDATES = [
   process.env.FFMPEG_PATH,
@@ -39,20 +40,65 @@ export function isSafeMediaUrl(raw: string): boolean {
   }
 }
 
-export function resolveMediaUrl(raw: string, requestOrigin: string): string {
-  if (!isSafeMediaUrl(raw)) {
-    throw new Error('非法媒体地址');
-  }
-  if (raw.startsWith('/')) {
-    return new URL(raw, requestOrigin).toString();
+export function rewritePlaylistThroughProxy(
+  body: string,
+  playlistUrl: string,
+  proxyPath = '/api/tesla/proxy?url='
+): string {
+  const base = new URL(playlistUrl);
+  return body
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+      if (trimmed.startsWith('#')) {
+        return line.replace(/URI="([^"]+)"/g, (_match, uri: string) => {
+          const absolute = new URL(uri, base).toString();
+          return `URI="${proxyPath}${encodeURIComponent(absolute)}"`;
+        });
+      }
+      const absolute = new URL(trimmed, base).toString();
+      return `${proxyPath}${encodeURIComponent(absolute)}`;
+    })
+    .join('\n');
+}
+
+export function unwrapProxiedMediaUrl(raw: string): string {
+  if (!raw.startsWith('/api/proxy/')) return raw;
+  try {
+    const parsed = new URL(raw, 'http://local.invalid');
+    if (
+      parsed.pathname !== '/api/proxy/m3u8' &&
+      parsed.pathname !== '/api/proxy/vod/m3u8'
+    ) {
+      return raw;
+    }
+    const inner = parsed.searchParams.get('url');
+    if (inner && isSafeMediaUrl(inner) && !inner.startsWith('/')) {
+      return inner;
+    }
+  } catch {
+    // 保持原地址
   }
   return raw;
+}
+
+export function resolveMediaUrl(raw: string, requestOrigin: string): string {
+  const unwrapped = unwrapProxiedMediaUrl(raw);
+  if (!isSafeMediaUrl(unwrapped)) {
+    throw new Error('非法媒体地址');
+  }
+  if (unwrapped.startsWith('/')) {
+    return new URL(unwrapped, requestOrigin).toString();
+  }
+  return unwrapped;
 }
 
 export type TeslaStreamKind = 'mpegts' | 'audio';
 
 function buildFfmpegArgs(kind: TeslaStreamKind, inputUrl: string): string[] {
-  const commonInput = [
+  const hls = /\.m3u8?(\?|$)/i.test(inputUrl);
+  const beforeInput = [
     '-hide_banner',
     '-loglevel',
     'error',
@@ -64,20 +110,28 @@ function buildFfmpegArgs(kind: TeslaStreamKind, inputUrl: string): string[] {
     '5',
     '-rw_timeout',
     '15000000',
-    '-i',
-    inputUrl,
+    '-fflags',
+    'nobuffer+discardcorrupt+genpts',
+    '-flags',
+    'low_delay',
+    '-probesize',
+    '32768',
+    '-analyzeduration',
+    '0',
   ];
+  // 和 WebCodecs 一样从倒数第 3 个完整分片起播，避免声音从播放列表开头、画面从直播沿。
+  if (hls) {
+    beforeInput.push('-live_start_index', '-3');
+  }
+  beforeInput.push('-i', inputUrl);
 
   if (kind === 'mpegts') {
     return [
-      ...commonInput,
-      '-an',
-      '-f',
-      'mpegts',
-      '-codec:v',
+      ...beforeInput,
+      '-vf',
+      'scale=960:540:flags=bicubic,pad=960:544:0:2,format=yuv420p',
+      '-c:v',
       'mpeg1video',
-      '-s',
-      '960x540',
       '-b:v',
       '1400k',
       '-maxrate',
@@ -88,14 +142,26 @@ function buildFfmpegArgs(kind: TeslaStreamKind, inputUrl: string): string[] {
       '0',
       '-r',
       '24',
+      '-c:a',
+      'mp2',
+      '-b:a',
+      '128k',
+      '-ar',
+      '44100',
+      '-ac',
+      '2',
       '-muxdelay',
-      '0.001',
+      '0',
+      '-muxpreload',
+      '0',
+      '-f',
+      'mpegts',
       'pipe:1',
     ];
   }
 
   return [
-    ...commonInput,
+    ...beforeInput,
     '-vn',
     '-f',
     'mp3',
@@ -114,7 +180,7 @@ function buildFfmpegArgs(kind: TeslaStreamKind, inputUrl: string): string[] {
 export function spawnTeslaFfmpeg(
   kind: TeslaStreamKind,
   inputUrl: string
-): ChildProcessWithoutNullStreams {
+): ChildProcessByStdio<null, Readable, Readable> {
   const ffmpegPath = resolveFfmpegPath();
   if (!ffmpegPath) {
     throw new Error('服务器未安装 ffmpeg，无法启用 Tesla 画布播放');

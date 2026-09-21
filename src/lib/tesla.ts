@@ -1,5 +1,8 @@
 const TESLA_PASSENGER_MODE_KEY = 'moontv_tesla_passenger_mode';
+const TESLA_PLAYBACK_MODE_KEY = 'moontv_tesla_playback_mode';
 const TESLA_FORCE_KEY = 'moontv_force_tesla';
+
+export type TeslaPlaybackMode = 'compat' | 'webcodecs';
 
 let prototypePatched = false;
 let originalPause: (() => void) | null = null;
@@ -32,6 +35,36 @@ export function getTeslaPassengerMode(): boolean {
   }
   // 默认：检测到 Tesla 时开启乘客模式
   return isTeslaBrowser();
+}
+
+export function isTeslaWebCodecsSupported(): boolean {
+  if (typeof window === 'undefined') return false;
+  return typeof (window as Window & { VideoDecoder?: unknown }).VideoDecoder === 'function';
+}
+
+export function getTeslaPlaybackMode(): TeslaPlaybackMode {
+  if (typeof window === 'undefined') return 'compat';
+  try {
+    const saved = localStorage.getItem(TESLA_PLAYBACK_MODE_KEY);
+    if (saved === 'webcodecs' && isTeslaWebCodecsSupported()) return 'webcodecs';
+  } catch {
+    // ignore
+  }
+  return 'compat';
+}
+
+export function setTeslaPlaybackMode(mode: TeslaPlaybackMode): void {
+  if (typeof window === 'undefined') return;
+  const next: TeslaPlaybackMode =
+    mode === 'webcodecs' && isTeslaWebCodecsSupported() ? 'webcodecs' : 'compat';
+  try {
+    localStorage.setItem(TESLA_PLAYBACK_MODE_KEY, next);
+  } catch {
+    // ignore
+  }
+  window.dispatchEvent(
+    new CustomEvent('moontv:tesla-playback-mode', { detail: { mode: next } })
+  );
 }
 
 export function setTeslaPassengerMode(enabled: boolean): void {

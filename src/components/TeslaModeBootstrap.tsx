@@ -6,9 +6,13 @@ import { Car, X } from 'lucide-react';
 import {
   applyTeslaDocumentHints,
   getTeslaPassengerMode,
+  getTeslaPlaybackMode,
   installTeslaPassengerPatch,
   isTeslaBrowser,
+  isTeslaWebCodecsSupported,
   setTeslaPassengerMode,
+  setTeslaPlaybackMode,
+  type TeslaPlaybackMode,
 } from '@/lib/tesla';
 
 /**
@@ -43,12 +47,16 @@ type TeslaPassengerBarProps = {
 export function TeslaPassengerBar({ className = '' }: TeslaPassengerBarProps) {
   const [visible, setVisible] = useState(false);
   const [enabled, setEnabled] = useState(false);
+  const [playbackMode, setPlaybackMode] = useState<TeslaPlaybackMode>('compat');
+  const [webCodecsSupported, setWebCodecsSupported] = useState(false);
   const [dismissed, setDismissed] = useState(false);
 
   useEffect(() => {
     const tesla = isTeslaBrowser();
     setVisible(tesla);
     setEnabled(getTeslaPassengerMode());
+    setPlaybackMode(getTeslaPlaybackMode());
+    setWebCodecsSupported(isTeslaWebCodecsSupported());
     applyTeslaDocumentHints();
 
     const onMode = (event: Event) => {
@@ -60,7 +68,15 @@ export function TeslaPassengerBar({ className = '' }: TeslaPassengerBarProps) {
       }
     };
     window.addEventListener('moontv:tesla-passenger-mode', onMode);
-    return () => window.removeEventListener('moontv:tesla-passenger-mode', onMode);
+    const onPlayback = (event: Event) => {
+      const mode = (event as CustomEvent).detail?.mode;
+      setPlaybackMode(mode === 'webcodecs' ? 'webcodecs' : 'compat');
+    };
+    window.addEventListener('moontv:tesla-playback-mode', onPlayback);
+    return () => {
+      window.removeEventListener('moontv:tesla-passenger-mode', onMode);
+      window.removeEventListener('moontv:tesla-playback-mode', onPlayback);
+    };
   }, []);
 
   if (!visible || dismissed) return null;
@@ -74,8 +90,38 @@ export function TeslaPassengerBar({ className = '' }: TeslaPassengerBarProps) {
       <div className='min-w-0 flex-1'>
         <div className='font-semibold'>Tesla 乘客模式 {enabled ? '已开启' : '已关闭'}</div>
         <div className='text-xs text-white/70'>
-          D 档画面冻结时将改用画布转码播放（不经 video）。请仅供副驾/后排观看。
+          兼容模式走服务端转码，老车机更稳。高清模式用 WebCodecs 解原画，不转码。请仅供副驾/后排观看。
         </div>
+        {enabled && (
+          <div className='mt-2 flex gap-2'>
+            <button
+              type='button'
+              className={`rounded-lg px-2.5 py-1 text-xs font-bold ${
+                playbackMode === 'compat' ? 'bg-white text-black' : 'bg-white/10 text-white'
+              }`}
+              onClick={() => {
+                setTeslaPlaybackMode('compat');
+                setPlaybackMode('compat');
+              }}
+            >
+              兼容
+            </button>
+            <button
+              type='button'
+              disabled={!webCodecsSupported}
+              title={webCodecsSupported ? 'WebCodecs 原画' : '当前浏览器不支持 WebCodecs'}
+              className={`rounded-lg px-2.5 py-1 text-xs font-bold disabled:cursor-not-allowed disabled:opacity-40 ${
+                playbackMode === 'webcodecs' ? 'bg-emerald-400 text-black' : 'bg-white/10 text-white'
+              }`}
+              onClick={() => {
+                setTeslaPlaybackMode('webcodecs');
+                setPlaybackMode('webcodecs');
+              }}
+            >
+              高清
+            </button>
+          </div>
+        )}
       </div>
       <button
         type='button'
