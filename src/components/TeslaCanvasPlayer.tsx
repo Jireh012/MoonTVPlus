@@ -3,7 +3,12 @@
 import { Loader2, Pause, Play, RefreshCw, Volume2, VolumeX } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import { getTeslaPlaybackMode, type TeslaPlaybackMode } from '@/lib/tesla';
+import {
+  getTeslaPlaybackMode,
+  isTeslaWebCodecsSupported,
+  setTeslaPlaybackMode,
+  type TeslaPlaybackMode,
+} from '@/lib/tesla';
 import { startTeslaWebCodecs } from '@/lib/tesla-webcodecs';
 
 declare global {
@@ -180,6 +185,8 @@ export default function TeslaCanvasPlayer({
     let cancelled = false;
     // JSMpeg 兼容模式的渲染循环定时器（见 start 内的接管逻辑）
     let jsmpegLoopTimer: number | null = null;
+    // MJPEG 模式收起加载遮罩的定时器（multipart 流的 load 事件不可靠）
+    let mjpegLoadingTimer: number | null = null;
     const stopJsmpegLoop = () => {
       if (jsmpegLoopTimer != null) {
         window.clearInterval(jsmpegLoopTimer);
@@ -208,24 +215,32 @@ export default function TeslaCanvasPlayer({
             audio.src = audioApi;
             audio.muted = muted;
           }
-          img.onload = () => {
-            if (cancelled) return;
-            setLoading(false);
-            if (audio) {
-              const playResult = audio.play();
-              if (playResult && typeof playResult.catch === 'function') {
-                playResult.catch(() => setNeedGesture(true));
-              }
-            }
-          };
           img.onerror = () => {
             if (cancelled) return;
+            // 服务端没装 ffmpeg 时优先退回 WebCodecs 原画，两条路都不通再报错
+            if (isTeslaWebCodecsSupported()) {
+              setTeslaPlaybackMode('webcodecs');
+              return;
+            }
             const message = 'MJPEG 帧流加载失败，请确认服务端已安装 ffmpeg';
             setError(message);
             setLoading(false);
             onError?.(message);
           };
           img.src = `/api/tesla/mjpeg?url=${encodeURIComponent(src)}`;
+
+          // multipart 流的 load 事件在车机上不可靠，音频立刻起播、遮罩定时收起
+          if (audio) {
+            const playResult = audio.play();
+            if (playResult && typeof playResult.catch === 'function') {
+              playResult.catch(() => setNeedGesture(true));
+            }
+          }
+          if (mjpegLoadingTimer != null) window.clearTimeout(mjpegLoadingTimer);
+          mjpegLoadingTimer = window.setTimeout(() => {
+            if (!cancelled) setLoading(false);
+          }, 1500);
+
           playerRef.current = {
             destroy: () => {
               img.onload = null;
@@ -391,6 +406,10 @@ export default function TeslaCanvasPlayer({
     return () => {
       cancelled = true;
       stopJsmpegLoop();
+      if (mjpegLoadingTimer != null) {
+        window.clearTimeout(mjpegLoadingTimer);
+        mjpegLoadingTimer = null;
+      }
       cleanup();
     };
     // muted 不重拉流，仅在按钮里改 audio.muted；streamNonce 用于「重新同步」
