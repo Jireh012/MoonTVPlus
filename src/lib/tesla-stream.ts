@@ -102,6 +102,18 @@ export function parseStartSeconds(raw: string | null): number | undefined {
   return Math.min(value, 360000);
 }
 
+/**
+ * 解析路由上的 rate 查询参数（倍速）。
+ * 只接受 0.5~2 之间的值——画布模式是服务端实时转码，放任 ?rate=100 会直接把服务器 CPU 打满。
+ * 客户端可选的档位是 0.5 / 1 / 1.25 / 1.5 / 2（见 TeslaCanvasPlayer 的 RATE_ORDER）。
+ */
+export function parsePlaybackRate(raw: string | null): number {
+  if (!raw) return 1;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 0.5 || value > 2) return 1;
+  return Math.round(value * 100) / 100;
+}
+
 export type TeslaStreamKind = 'mpegts' | 'audio' | 'mjpeg';
 
 const MJPEG_FPS = Math.max(8, Math.min(30, Number(process.env.MJPEG_FPS) || 18));
@@ -171,7 +183,8 @@ export function buildFfmpegArgs(
   kind: TeslaStreamKind,
   inputUrl: string,
   startSeconds?: number,
-  quality: TeslaQuality = DEFAULT_QUALITY
+  quality: TeslaQuality = DEFAULT_QUALITY,
+  playbackRate = 1
 ): string[] {
   const hls =
     /\.m3u8?(\?|$)/i.test(inputUrl) || inputUrl.includes('proxy-m3u8');
@@ -216,11 +229,23 @@ export function buildFfmpegArgs(
     // 关键：极简 MJPEG 模式的画面是一条 image2pipe 裸流，浏览器端没有任何时钟可循，
     // ffmpeg 不加 -re 会按解码速度全速出帧——车机上就是画面 2~5 倍速快进、声音正常 1x，
     // 表现为声画不同步。加 -re 让画面按片源原生节拍实时输出，与音频流的 1x 对齐。
-    beforeInput.push('-re');
+    //
+    // 倍速：-re 就是 -readrate 1，所以倍速直接换成 -readrate <rate>。
+    // 画面帧率（-r）保持不变——2x 时每墙钟秒出来的帧数自然翻倍，这才是倍速该有的样子。
+    if (playbackRate === 1) {
+      beforeInput.push('-re');
+    } else {
+      beforeInput.push('-readrate', String(playbackRate));
+    }
   }
   beforeInput.push('-i', inputUrl);
 
   const preset = TESLA_QUALITY_PRESETS[quality];
+
+  // 音频流：倍速靠 atempo 把内容压缩/拉长，输出仍是 1 墙钟秒 1 秒数据，
+  // 由浏览器端的 TCP 背压节奏消费（1x 时本来也不加 -re）。atempo 支持 0.5~2.0，正好覆盖我们的档位。
+  const audioFilters: string[] =
+    playbackRate !== 1 ? ['-filter:a', `atempo=${playbackRate}`] : [];
 
   if (kind === 'mpegts') {
     return [
@@ -240,6 +265,7 @@ export function buildFfmpegArgs(
       '0',
       '-r',
       '24',
+      ...audioFilters,
       '-c:a',
       'mp2',
       '-b:a',
@@ -279,6 +305,7 @@ export function buildFfmpegArgs(
 
   return [
     ...beforeInput,
+    ...audioFilters,
     '-vn',
     '-f',
     'mp3',
@@ -354,14 +381,15 @@ export function spawnTeslaFfmpeg(
   kind: TeslaStreamKind,
   inputUrl: string,
   startSeconds?: number,
-  quality?: TeslaQuality
+  quality?: TeslaQuality,
+  playbackRate?: number
 ): ChildProcessByStdio<null, Readable, Readable> {
   const ffmpegPath = resolveFfmpegPath();
   if (!ffmpegPath) {
     throw new Error('服务器未安装 ffmpeg，无法启用 Tesla 画布播放');
   }
 
-  const args = buildFfmpegArgs(kind, inputUrl, startSeconds, quality);
+  const args = buildFfmpegArgs(kind, inputUrl, startSeconds, quality, playbackRate);
   const child = spawn(ffmpegPath, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -372,6 +400,10 @@ export function spawnTeslaFfmpeg(
 // ---------------------------------------------------------------------------
 // ffprobe：给进度条提供片源总时长
 // ---------------------------------------------------------------------------
+
+/** 探测用的桌面 UA：不少采集源对 UA/Referer 敏感，裸请求会被 403 */
+const PROBE_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 const FFPROBE_CANDIDATES = [
   process.env.FFPROBE_PATH,
@@ -400,8 +432,13 @@ export function resolveFfprobePath(): string | null {
 }
 
 /**
- * 探测片源总时长（秒）。失败返回 null（前端隐藏进度条即可，不影响播放）。
+ * 探测片源总时长（秒）。失败返回 null（前端把进度条退化为「不可拖动」即可，不影响播放）。
  * 注意 ffmpeg/ffprobe 会继承 Node 进程的 http_proxy 环境变量，内网源若有代理要求由部署方处理。
+ *
+ * 实测：对真实的远端 HLS，ffprobe 为了拿到 format=duration 会真的去拉分片，
+ * 直连就要 ~5s，经 /api/proxy-m3u8 再包一层能到 23~50s，远超这里的 15s 上限 →
+ * 返回 null → 车机上进度条直接不出现。所以这条只作为兜底，主路径用下面的
+ * fetchHlsDuration（只读播放列表文本，快得多）。
  */
 export function probeMediaDuration(
   inputUrl: string
@@ -432,6 +469,11 @@ export function probeMediaDuration(
       [
         '-v',
         'error',
+        // 不少采集源对 UA/Referer 敏感，裸 ffprobe 会被 403
+        '-user_agent',
+        PROBE_USER_AGENT,
+        '-rw_timeout',
+        '12000000',
         '-show_entries',
         'format=duration',
         '-of',
@@ -453,14 +495,136 @@ export function probeMediaDuration(
   });
 }
 
+// ---------------------------------------------------------------------------
+// HLS 播放列表时长：进度条的主路径
+// ---------------------------------------------------------------------------
+
+async function fetchTextWithTimeout(
+  url: string,
+  timeoutMs: number
+): Promise<{ text: string; finalUrl: string } | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      redirect: 'follow',
+      cache: 'no-store',
+      headers: {
+        'User-Agent': PROBE_USER_AGENT,
+        Accept: '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      },
+    });
+    if (!response.ok) return null;
+    const text = await response.text();
+    return { text, finalUrl: response.url || url };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 直接解析 HLS 播放列表求总时长：累加 media playlist 的 EXTINF。
+ *
+ * 比 ffprobe 快一个数量级（后者为了 format=duration 会真的去读分片），
+ * master playlist 会挑码率最高的变体递归下去（最多两层）。
+ * 直播流（没有 EXT-X-ENDLIST）没有总时长，返回 null 让前端把进度条变成不可拖动。
+ */
+export async function fetchHlsDuration(
+  url: string,
+  timeoutMs = 8000,
+  depth = 0
+): Promise<number | null> {
+  if (depth > 2) return null;
+  const page = await fetchTextWithTimeout(url, timeoutMs);
+  if (!page) return null;
+  const text = page.text;
+  if (!text.trimStart().startsWith('#EXTM3U')) return null; // 不是 HLS，交给 ffprobe
+
+  const lines = text.split(/\r?\n/);
+
+  // master playlist：#EXT-X-STREAM-INF: 的下一行是变体地址
+  const variants: { url: string; bandwidth: number }[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (!line.startsWith('#EXT-X-STREAM-INF:')) continue;
+    const next = (lines[i + 1] || '').trim();
+    if (!next || next.startsWith('#')) continue;
+    try {
+      variants.push({
+        url: new URL(next, page.finalUrl).toString(),
+        bandwidth: Number(/BANDWIDTH=(\d+)/i.exec(line)?.[1] || 0),
+      });
+    } catch {
+      // 忽略解析不了的变体
+    }
+  }
+  if (variants.length > 0) {
+    variants.sort((a, b) => b.bandwidth - a.bandwidth);
+    for (const variant of variants) {
+      const value = await fetchHlsDuration(variant.url, timeoutMs, depth + 1);
+      if (value && value > 0) return value;
+    }
+    return null;
+  }
+
+  let total = 0;
+  let segments = 0;
+  for (const line of lines) {
+    const match = /^#EXTINF:\s*([\d.]+)/.exec(line.trim());
+    if (!match) continue;
+    const value = Number(match[1]);
+    if (Number.isFinite(value) && value > 0) {
+      total += value;
+      segments += 1;
+    }
+  }
+  if (segments === 0) return null;
+  if (!text.includes('#EXT-X-ENDLIST')) return null; // 直播/滚动窗口，长度还会变
+  return Math.round(total * 100) / 100;
+}
+
+/**
+ * 从站内代理地址里取出上游真实地址。
+ *
+ * 去广告开关打开时，画布模式会把源包成 /api/proxy-m3u8?url=<上游> 再交给各条流，
+ * 于是时长探测也会拿到这个包装地址。对探测来说绕这一圈纯亏：
+ * 每个播放列表都要多走一趟 Next 路由（实测 50s vs 直连 4.8s），而且
+ * proxy-m3u8 只做分片过滤，不影响总时长。所以探测前先把它拆开。
+ *
+ * 注意：不能用 resolveMediaUrl 去拆——字节流那边必须保留包装才有去广告效果。
+ */
+export function extractUpstreamPlaylistUrl(raw: string): string | null {
+  try {
+    const parsed = new URL(raw, 'http://local.invalid');
+    if (
+      parsed.pathname !== '/api/proxy-m3u8' &&
+      parsed.pathname !== '/api/proxy/m3u8' &&
+      parsed.pathname !== '/api/proxy/vod/m3u8'
+    ) {
+      return null;
+    }
+    const inner = parsed.searchParams.get('url');
+    if (!inner) return null;
+    if (!isSafeMediaUrl(inner) || inner.startsWith('/')) return null;
+    return inner;
+  } catch {
+    return null;
+  }
+}
+
 export function createFfmpegReadableStream(
   kind: TeslaStreamKind,
   inputUrl: string,
   signal?: AbortSignal,
   startSeconds?: number,
-  quality?: TeslaQuality
+  quality?: TeslaQuality,
+  playbackRate?: number
 ): ReadableStream<Uint8Array> {
-  const child = spawnTeslaFfmpeg(kind, inputUrl, startSeconds, quality);
+  const child = spawnTeslaFfmpeg(kind, inputUrl, startSeconds, quality, playbackRate);
   let closed = false;
 
   const kill = () => {

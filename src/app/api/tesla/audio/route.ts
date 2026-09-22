@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getAuthInfoFromCookie } from '@/lib/auth';
 import {
   createFfmpegReadableStream,
+  parsePlaybackRate,
   parseStartSeconds,
   resolveFfmpegPath,
   resolveMediaUrl,
@@ -35,7 +36,9 @@ export async function GET(request: NextRequest) {
       'audio',
       inputUrl,
       request.signal,
-      parseStartSeconds(request.nextUrl.searchParams.get('start'))
+      parseStartSeconds(request.nextUrl.searchParams.get('start')),
+      undefined,
+      parsePlaybackRate(request.nextUrl.searchParams.get('rate'))
     );
 
     return new Response(stream, {

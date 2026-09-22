@@ -4,6 +4,7 @@ import { getAuthInfoFromCookie } from '@/lib/auth';
 import {
   createFfmpegReadableStream,
   createMjpegMultipartStream,
+  parsePlaybackRate,
   parseQuality,
   parseStartSeconds,
   resolveFfmpegPath,
@@ -44,7 +45,8 @@ export async function GET(request: NextRequest) {
       inputUrl,
       request.signal,
       parseStartSeconds(request.nextUrl.searchParams.get('start')),
-      parseQuality(request.nextUrl.searchParams.get('q'))
+      parseQuality(request.nextUrl.searchParams.get('q')),
+      parsePlaybackRate(request.nextUrl.searchParams.get('rate'))
     );
     const stream = jpegStream.pipeThrough(createMjpegMultipartStream());
 

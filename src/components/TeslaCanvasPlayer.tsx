@@ -6,6 +6,8 @@ import {
   Minimize,
   Pause,
   Play,
+  RotateCcw,
+  RotateCw,
   Shield,
   ShieldOff,
   Volume2,
@@ -22,9 +24,18 @@ const QUALITY_DIMS: Record<TeslaQuality, { w: number; h: number; label: string }
 };
 const QUALITY_ORDER: TeslaQuality[] = ['low', 'std', 'high'];
 
+/** 倍速档位：服务端 -readrate / atempo 只接受 0.5~2 */
+const RATE_ORDER = [0.5, 1, 1.25, 1.5, 2];
+const SKIP_SECONDS = 10;
+
 const LS_QUALITY = 'moontv_tesla_quality';
 const LS_AD_FILTER = 'moontv_tesla_ad_filter';
 const LS_SYNC_DELTA = 'moontv_tesla_sync_delta';
+const LS_RATE = 'moontv_tesla_rate';
+const LS_VOLUME = 'moontv_tesla_volume';
+
+/** 时长探测失败后的重试节奏（毫秒）：片源慢/抖动时靠它把进度条补上 */
+const DURATION_RETRY_DELAYS = [0, 4000, 12000, 30000];
 
 type TeslaCanvasPlayerProps = {
   src: string;
@@ -67,9 +78,25 @@ function isHlsSource(url: string): boolean {
 }
 
 /**
+ * input[type=range] 用了 appearance-none，WebKit/Blink 下必须自己画滑块，
+ * 否则车机浏览器里只剩一条灰线、拖都拖不动（看着就像「进度条不见了」）。
+ */
+const SLIDER_CLASS = [
+  'h-1.5 cursor-pointer appearance-none rounded-full bg-white/25 accent-emerald-400',
+  '[&::-webkit-slider-thumb]:h-3.5 [&::-webkit-slider-thumb]:w-3.5 [&::-webkit-slider-thumb]:appearance-none',
+  '[&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-emerald-400 [&::-webkit-slider-thumb]:shadow',
+  '[&::-moz-range-thumb]:h-3.5 [&::-moz-range-thumb]:w-3.5 [&::-moz-range-thumb]:rounded-full',
+  '[&::-moz-range-thumb]:border-0 [&::-moz-range-thumb]:bg-emerald-400',
+  'disabled:cursor-not-allowed disabled:opacity-50',
+].join(' ');
+
+/**
  * Tesla 画布播放器（极简 MJPEG 单模式）：
  * 画面由 <img> 直接收服务端 ffmpeg 转出的 multipart JPEG 帧流，
  * 音频走独立 MP3 流（<audio> 元素）。不依赖 <video> 与 rAF，D 档最抗冻结。
+ *
+ * 控件对齐「正常模式」的 Artplayer：播放/暂停、进度条（可拖动）、±10s、
+ * 音量、静音、倍速、清晰度、音画校准、去广告、全屏（原生 + 网页全屏兜底）。
  */
 export default function TeslaCanvasPlayer({
   src,
@@ -113,8 +140,10 @@ export default function TeslaCanvasPlayer({
   const everReadyRef = useRef(false);
   // 暂停：把当前帧画到 canvas 冻结显示，音频暂停，画面流断开；恢复时从当前位置重拉
   const [frozen, setFrozen] = useState(false);
-  // 全屏
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  // 全屏：原生全屏（桌面/支持的浏览器）与 CSS 网页全屏（车机浏览器没有 Fullscreen API 时的兜底）
+  const [nativeFullscreen, setNativeFullscreen] = useState(false);
+  const [cssFullscreen, setCssFullscreen] = useState(false);
+  const fsFallbackTimerRef = useRef<number | null>(null);
   // 清晰度（本地持久化，重启流生效）
   const [quality, setQuality] = useState<TeslaQuality>(() => {
     if (typeof window === 'undefined') return 'std';
@@ -132,6 +161,18 @@ export default function TeslaCanvasPlayer({
     const v = Number(window.localStorage.getItem(LS_SYNC_DELTA));
     return Number.isFinite(v) ? Math.max(-10, Math.min(10, v)) : 0;
   });
+  // 倍速：服务端 -readrate（画面）+ atempo（声音）联合实现，本地持久化
+  const [rate, setRate] = useState<number>(() => {
+    if (typeof window === 'undefined') return 1;
+    const v = Number(window.localStorage.getItem(LS_RATE));
+    return RATE_ORDER.includes(v) ? v : 1;
+  });
+  // 音量：对齐正常模式的 0~1 滑杆
+  const [volume, setVolume] = useState<number>(() => {
+    if (typeof window === 'undefined') return 1;
+    const v = Number(window.localStorage.getItem(LS_VOLUME));
+    return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 1;
+  });
 
   useEffect(() => {
     window.localStorage.setItem(LS_QUALITY, quality);
@@ -142,6 +183,12 @@ export default function TeslaCanvasPlayer({
   useEffect(() => {
     window.localStorage.setItem(LS_SYNC_DELTA, String(syncDelta));
   }, [syncDelta]);
+  useEffect(() => {
+    window.localStorage.setItem(LS_RATE, String(rate));
+  }, [rate]);
+  useEffect(() => {
+    window.localStorage.setItem(LS_VOLUME, String(volume));
+  }, [volume]);
 
   // onReady / onError / onProgress 用 ref 转发：父组件传的多是内联箭头函数，每次渲染
   // 都是新引用，若直接进 useEffect 依赖数组，父页面任何一次 setState 都会重跑 effect →
@@ -153,6 +200,14 @@ export default function TeslaCanvasPlayer({
   const onProgressRef = useRef(onProgress);
   onProgressRef.current = onProgress;
 
+  // 音量/静音跟随 state（换流时 audio.src 变化不会重置这两个属性，但重挂载会）
+  useEffect(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.volume = volume;
+    audio.muted = muted;
+  }, [volume, muted, streamNonce, started]);
+
   // 去广告：HLS 源经 /api/proxy-m3u8 包裹，由服务端执行去广告规则并递归过滤子播放列表；
   // 非 HLS（直链 mp4 等）没有广告分片的概念，原样播放
   const hlsSource = isHlsSource(src);
@@ -163,23 +218,146 @@ export default function TeslaCanvasPlayer({
         }`
       : src;
 
-  // 全屏状态同步
+  // -----------------------------------------------------------------------
+  // 全屏
+  // -----------------------------------------------------------------------
+
+  // 原生全屏状态同步（含 webkit 前缀：车机/旧内核只会派发 webkitfullscreenchange）
   useEffect(() => {
-    const onFsChange = () => setIsFullscreen(!!document.fullscreenElement);
-    document.addEventListener('fullscreenchange', onFsChange);
-    return () =>
-      document.removeEventListener('fullscreenchange', onFsChange);
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+    };
+    const onChange = () =>
+      setNativeFullscreen(!!(doc.fullscreenElement || doc.webkitFullscreenElement));
+    document.addEventListener('fullscreenchange', onChange);
+    document.addEventListener('webkitfullscreenchange', onChange);
+    onChange();
+    return () => {
+      document.removeEventListener('fullscreenchange', onChange);
+      document.removeEventListener('webkitfullscreenchange', onChange);
+    };
   }, []);
 
-  const toggleFullscreen = () => {
-    const el = containerRef.current;
-    if (!el) return;
-    if (document.fullscreenElement) {
-      document.exitFullscreen?.().catch(() => undefined);
-    } else {
-      el.requestFullscreen?.().catch(() => undefined);
+  // CSS 网页全屏时锁滚动 + Esc 退出（原生全屏由浏览器自己处理 Esc）
+  useEffect(() => {
+    if (!cssFullscreen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setCssFullscreen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [cssFullscreen]);
+
+  useEffect(() => {
+    return () => {
+      if (fsFallbackTimerRef.current != null) {
+        window.clearTimeout(fsFallbackTimerRef.current);
+      }
+    };
+  }, []);
+
+  const isFullscreen = nativeFullscreen || cssFullscreen;
+
+  const exitFullscreen = useCallback(() => {
+    const doc = document as Document & {
+      webkitFullscreenElement?: Element | null;
+      webkitExitFullscreen?: () => void;
+    };
+    if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+      try {
+        if (doc.exitFullscreen) {
+          void doc.exitFullscreen().catch(() => undefined);
+        } else if (doc.webkitExitFullscreen) {
+          doc.webkitExitFullscreen();
+        }
+      } catch {
+        // ignore
+      }
     }
-  };
+    setCssFullscreen(false);
+  }, []);
+
+  const enterFullscreen = useCallback(() => {
+    const el = containerRef.current as
+      | (HTMLDivElement & {
+          webkitRequestFullscreen?: (...args: never[]) => unknown;
+        })
+      | null;
+    if (!el) return;
+    const request:
+      | ((...args: never[]) => unknown)
+      | undefined =
+      el.requestFullscreen?.bind(el) || el.webkitRequestFullscreen?.bind(el);
+
+    // 车机浏览器（以及被策略禁用的环境）常常没有 Fullscreen API，或者调用了也没反应。
+    // 这种情况直接用 CSS 网页全屏——和正常模式里 Artplayer 的「网页全屏」是同一套做法，
+    // 任何浏览器都能全屏，也是「点了全屏没反应」这个问题的正解。
+    if (typeof request !== 'function') {
+      setCssFullscreen(true);
+      return;
+    }
+
+    let settled = false;
+    const clearFallback = () => {
+      if (fsFallbackTimerRef.current === fallbackTimer) {
+        window.clearTimeout(fallbackTimer);
+        fsFallbackTimerRef.current = null;
+      }
+    };
+    const fallbackTimer = window.setTimeout(() => {
+      fsFallbackTimerRef.current = null;
+      const doc = document as Document & {
+        webkitFullscreenElement?: Element | null;
+      };
+      if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+        setNativeFullscreen(true);
+        return;
+      }
+      if (settled) return;
+      settled = true;
+      setCssFullscreen(true);
+    }, 900);
+    fsFallbackTimerRef.current = fallbackTimer;
+
+    try {
+      const result = request();
+      if (result instanceof Promise) {
+        result
+          .then(() => {
+            clearFallback();
+            settled = true;
+            setNativeFullscreen(true);
+            setCssFullscreen(false);
+          })
+          .catch(() => {
+            clearFallback();
+            if (settled) return;
+            settled = true;
+            setCssFullscreen(true);
+          });
+      }
+    } catch {
+      clearFallback();
+      if (!settled) {
+        settled = true;
+        setCssFullscreen(true);
+      }
+    }
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    if (nativeFullscreen || cssFullscreen) exitFullscreen();
+    else enterFullscreen();
+  }, [nativeFullscreen, cssFullscreen, exitFullscreen, enterFullscreen]);
+
+  // -----------------------------------------------------------------------
+  // 时间轴
+  // -----------------------------------------------------------------------
 
   /** 已播内容时间（不含起播偏移）。画面流没有时钟，用 <audio> 的 currentTime。 */
   const getStreamClock = useCallback((): number => {
@@ -257,7 +435,7 @@ export default function TeslaCanvasPlayer({
       };
 
       // 起播偏移：拖动进度 / 续播都靠它拼进画面流地址（服务端 -ss 输入定位）；
-      // 音画校准 delta 加在音频流上（+ = 声音领先画面）
+      // 音画校准 delta 加在音频流上（+ = 声音领先画面）；倍速由服务端 -readrate/atempo 承担
       const offset = Math.floor(offsetRef.current);
       const delta = Math.round(syncDelta * 10) / 10;
       const videoStart = Math.max(0, offset);
@@ -265,6 +443,8 @@ export default function TeslaCanvasPlayer({
       const videoStartQuery = videoStart > 0 ? `&start=${videoStart}` : '';
       const audioStartQuery = audioStart > 0 ? `&start=${audioStart}` : '';
       const qualityQuery = `&q=${quality}`;
+      // 1x 时不下发参数，保持和以前完全一致的流地址
+      const rateQuery = rate !== 1 ? `&rate=${rate}` : '';
 
       try {
         const audio = audioRef.current;
@@ -276,7 +456,8 @@ export default function TeslaCanvasPlayer({
           // 否则视频跳过了广告、音频还在播，两边会彻底错开
           audio.src = `/api/tesla/audio?url=${encodeURIComponent(
             effectiveSrc
-          )}${audioStartQuery}`;
+          )}${audioStartQuery}${rateQuery}`;
+          audio.volume = volume;
           audio.muted = muted;
           audio.onerror = () => handleStreamFailure('音频流加载失败');
           const playResult = audio.play();
@@ -288,7 +469,7 @@ export default function TeslaCanvasPlayer({
         img.onerror = () => handleStreamFailure('画面帧流加载失败');
         img.src = `/api/tesla/mjpeg?url=${encodeURIComponent(
           effectiveSrc
-        )}${videoStartQuery}${qualityQuery}`;
+        )}${videoStartQuery}${qualityQuery}${rateQuery}`;
 
         // multipart 流的 load 事件在车机上不可靠，遮罩定时收起即视为已就绪。
         // 时长随清晰度自适应：1080p 源实测高清档首字节要 ~9.5s（标清 ~4s），
@@ -323,31 +504,66 @@ export default function TeslaCanvasPlayer({
       }
       cleanup();
     };
-    // muted 不重拉流，仅在按钮里改 audio.muted；streamNonce 用于「重新同步/暂停恢复」；
-    // seekNonce 用于拖动进度；quality / syncDelta / adFilter 变化都需要整流重启；
+    // muted/volume 不重拉流，仅在 state 变化时改 audio 属性；streamNonce 用于「暂停恢复/重试」；
+    // seekNonce 用于拖动进度；quality / syncDelta / adFilter / rate 变化都需要整流重启；
     // onError / onReady / onProgress 通过 ref 读取
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [src, cleanup, streamNonce, seekNonce, started, quality, syncDelta, adFilter]);
+  }, [
+    src,
+    cleanup,
+    streamNonce,
+    seekNonce,
+    started,
+    quality,
+    syncDelta,
+    adFilter,
+    rate,
+  ]);
 
-  // 拉取片源总时长（点播），进度条和续播判断都要用
+  // 拉取片源总时长（点播），进度条和续播判断都要用。
+  // 服务端探测可能因为慢 CDN 失败，这里按退避重试几次，避免进度条整场缺席。
   useEffect(() => {
     if (!started || isLive || !src) return;
     let cancelled = false;
-    fetch(`/api/tesla/duration?url=${encodeURIComponent(effectiveSrc)}`, {
-      credentials: 'same-origin',
-      cache: 'no-store',
-    })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((j: any) => {
-        if (cancelled || !j) return;
-        const value = Number(j.duration);
-        if (Number.isFinite(value) && value > 0) {
-          setDuration(value);
-        }
+    const timers: number[] = [];
+
+    const attempt = (index: number) => {
+      fetch(`/api/tesla/duration?url=${encodeURIComponent(effectiveSrc)}`, {
+        credentials: 'same-origin',
+        cache: 'no-store',
       })
-      .catch(() => undefined);
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j: { duration?: number | null } | null) => {
+          if (cancelled) return;
+          const value = Number(j?.duration);
+          if (Number.isFinite(value) && value > 0) {
+            setDuration(value);
+            return;
+          }
+          const next = index + 1;
+          if (next < DURATION_RETRY_DELAYS.length) {
+            timers.push(
+              window.setTimeout(() => attempt(next), DURATION_RETRY_DELAYS[next])
+            );
+          }
+        })
+        .catch(() => {
+          if (cancelled) return;
+          const next = index + 1;
+          if (next < DURATION_RETRY_DELAYS.length) {
+            timers.push(
+              window.setTimeout(() => attempt(next), DURATION_RETRY_DELAYS[next])
+            );
+          }
+        });
+    };
+
+    setDuration(0);
+    attempt(0);
+
     return () => {
       cancelled = true;
+      timers.forEach((t) => window.clearTimeout(t));
     };
     // effectiveSrc 随 adFilter 变化，但时长不变，不作为依赖
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -366,7 +582,7 @@ export default function TeslaCanvasPlayer({
     return () => window.clearInterval(timer);
   }, [started, isLive, duration, getAbsoluteTime]);
 
-  /** 拖动进度：更新偏移并整流重启（服务端 -ss 定位） */
+  /** 拖动进度 / ±10s：更新偏移并整流重启（服务端 -ss 定位） */
   const commitSeek = (target: number) => {
     const max = duration > 0 ? duration - 1 : target;
     const clamped = Math.max(0, Math.min(target, max));
@@ -375,6 +591,10 @@ export default function TeslaCanvasPlayer({
     setScrub(null);
     failCountRef.current = 0;
     setSeekNonce((n) => n + 1);
+  };
+
+  const skipBy = (seconds: number) => {
+    commitSeek(Math.max(0, getAbsoluteTime() + seconds));
   };
 
   const togglePlay = () => {
@@ -411,23 +631,68 @@ export default function TeslaCanvasPlayer({
   };
 
   const toggleMute = () => {
-    const audio = audioRef.current;
     const next = !muted;
     setMuted(next);
+    const audio = audioRef.current;
     if (audio) audio.muted = next;
+    // 从静音恢复但音量是 0 的话，给个可听的默认值，否则「取消静音」看起来还是没声音
+    if (!next && volume === 0) {
+      setVolume(1);
+      if (audio) audio.volume = 1;
+    }
   };
 
-  const showProgress = started && !isLive && duration > 0;
+  const cycleRate = () => {
+    const index = RATE_ORDER.indexOf(rate);
+    failCountRef.current = 0;
+    // 换档后从当前位置继续，别把进度拨回上次起播点
+    offsetRef.current = getAbsoluteTime();
+    setRate(RATE_ORDER[(index + 1) % RATE_ORDER.length]);
+  };
+
+  const cycleQuality = () => {
+    const index = QUALITY_ORDER.indexOf(quality);
+    failCountRef.current = 0;
+    offsetRef.current = getAbsoluteTime();
+    setQuality(QUALITY_ORDER[(index + 1) % QUALITY_ORDER.length]);
+  };
+
+  const toggleAdFilter = () => {
+    failCountRef.current = 0;
+    offsetRef.current = getAbsoluteTime();
+    setAdFilter((v) => !v);
+  };
+
+  const durationKnown = duration > 0;
+  // 进度条在点播下一律显示：以前以「探测到总时长」为显示条件，
+  // 探测失败（慢 CDN / 代理包装）时整条进度条消失，看起来像功能被删了。
+  const showProgress = started && !isLive;
   const sliderValue = scrub ?? Math.min(progressCurrent, duration || progressCurrent);
   const dims = QUALITY_DIMS[quality];
+  const canTapPause = started && !error && !needGesture;
 
   const controlBtn =
     'flex h-10 min-w-10 items-center justify-center gap-1 rounded-full bg-white/15 px-3 text-xs font-medium text-white backdrop-blur';
+  const roundBtn =
+    'flex h-10 w-10 items-center justify-center rounded-full bg-white/15 text-white backdrop-blur';
 
   return (
     <div
       ref={containerRef}
-      className={`relative flex h-full w-full flex-col overflow-hidden rounded-xl bg-black ${className}`}
+      className={`relative flex h-full w-full flex-col overflow-hidden bg-black ${className} ${
+        cssFullscreen ? 'z-[9999]' : 'rounded-xl'
+      }`}
+      style={
+        cssFullscreen
+          ? {
+              position: 'fixed',
+              inset: 0,
+              width: '100vw',
+              height: '100vh',
+              borderRadius: 0,
+            }
+          : undefined
+      }
     >
       {poster && (loading || !started) && (
         <div
@@ -449,6 +714,23 @@ export default function TeslaCanvasPlayer({
         className={`absolute inset-0 h-full w-full object-contain ${frozen ? 'invisible' : ''}`}
       />
       <audio ref={audioRef} preload='auto' playsInline />
+
+      {/* 点画面 → 播放/暂停，和正常模式（Artplayer）一致 */}
+      {canTapPause && (
+        <button
+          type='button'
+          className='absolute inset-0 z-[5] cursor-pointer'
+          aria-label={playing ? '暂停' : '播放'}
+          onClick={togglePlay}
+        />
+      )}
+
+      {/* 在手势浮层会盖住画面的场景下，标题挪到左上角，给底部控件腾出一整行 */}
+      {title && (
+        <div className='pointer-events-none absolute left-3 top-3 z-20 max-w-[70%] truncate rounded-lg bg-black/45 px-2 py-1 text-xs text-white/85'>
+          {title}
+        </div>
+      )}
 
       {/* 手势起播：点播模式不自动播放，点击后画面/声音同时开始拉流 */}
       {!started && !error && (
@@ -522,22 +804,31 @@ export default function TeslaCanvasPlayer({
         </div>
       )}
 
-      <div className='pointer-events-none absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/80 to-transparent p-4'>
-        {/* 进度条：支持拖动定位 */}
+      <div className='pointer-events-none absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/85 via-black/45 to-transparent px-3 pb-3 pt-8'>
+        {/* 进度条：支持拖动定位；总时长还没探测到时置灰但依然可见 */}
         {showProgress && (
-          <div className='pointer-events-auto mb-3 flex items-center gap-3'>
+          <div className='pointer-events-auto mb-2 flex items-center gap-2'>
             <span className='w-14 shrink-0 text-center text-xs tabular-nums text-white/85'>
               {formatTime(sliderValue)}
             </span>
             <input
               type='range'
               min={0}
-              max={Math.max(1, Math.floor(duration))}
+              max={durationKnown ? Math.max(1, Math.floor(duration)) : 100}
               step={1}
-              value={Math.min(Math.max(0, sliderValue), duration)}
-              title='拖动跳转进度'
+              value={
+                durationKnown
+                  ? Math.min(Math.max(0, sliderValue), duration)
+                  : 0
+              }
+              disabled={!durationKnown}
+              title={
+                durationKnown
+                  ? '拖动跳转进度'
+                  : '正在获取片长，稍后即可拖动（当前只能看已播时间）'
+              }
               aria-label='播放进度'
-              className='h-1.5 w-full cursor-pointer appearance-none rounded-full bg-white/25 accent-emerald-400'
+              className={`${SLIDER_CLASS} min-w-0 flex-1`}
               onChange={(e) => setScrub(Number(e.target.value))}
               onPointerUp={() => {
                 if (scrub != null) commitSeek(scrub);
@@ -549,11 +840,24 @@ export default function TeslaCanvasPlayer({
               }}
             />
             <span className='w-14 shrink-0 text-center text-xs tabular-nums text-white/85'>
-              {formatTime(duration)}
+              {durationKnown ? formatTime(duration) : '--:--'}
             </span>
           </div>
         )}
-        <div className='pointer-events-auto flex items-center gap-2'>
+
+        <div className='pointer-events-auto flex flex-wrap items-center gap-2'>
+          {/* ±10 秒（对齐正常模式的快进/快退）；直播没有可跳转的时间轴 */}
+          {showProgress && (
+            <button
+              type='button'
+              onClick={() => skipBy(-SKIP_SECONDS)}
+              className={roundBtn}
+              title={`后退 ${SKIP_SECONDS} 秒`}
+              aria-label={`后退 ${SKIP_SECONDS} 秒`}
+            >
+              <RotateCcw className='h-5 w-5' />
+            </button>
+          )}
           <button
             type='button'
             onClick={togglePlay}
@@ -561,20 +865,68 @@ export default function TeslaCanvasPlayer({
             aria-label={playing ? '暂停' : '播放'}
             title={playing ? '暂停（恢复时从当前位置继续）' : '播放'}
           >
-            {playing ? (
-              <Pause className='h-6 w-6' />
-            ) : (
-              <Play className='h-6 w-6' />
-            )}
+            {playing ? <Pause className='h-6 w-6' /> : <Play className='h-6 w-6' />}
           </button>
+          {showProgress && (
+            <button
+              type='button'
+              onClick={() => skipBy(SKIP_SECONDS)}
+              className={roundBtn}
+              title={`前进 ${SKIP_SECONDS} 秒`}
+              aria-label={`前进 ${SKIP_SECONDS} 秒`}
+            >
+              <RotateCw className='h-5 w-5' />
+            </button>
+          )}
+
+          {/* 音量：静音 + 滑杆 */}
+          <div className='flex items-center gap-1 rounded-full bg-white/10 px-2 py-1 backdrop-blur'>
+            <button
+              type='button'
+              onClick={toggleMute}
+              className='flex h-7 w-7 items-center justify-center rounded-full text-white hover:bg-white/20'
+              aria-label={muted ? '取消静音' : '静音'}
+              title={muted ? '取消静音' : '静音'}
+            >
+              {muted || volume === 0 ? (
+                <VolumeX className='h-4 w-4' />
+              ) : (
+                <Volume2 className='h-4 w-4' />
+              )}
+            </button>
+            <input
+              type='range'
+              min={0}
+              max={100}
+              step={1}
+              value={Math.round((muted ? 0 : volume) * 100)}
+              onChange={(e) => {
+                const next = Number(e.target.value) / 100;
+                setVolume(next);
+                const audio = audioRef.current;
+                if (audio) audio.volume = next;
+                if (muted && next > 0) {
+                  setMuted(false);
+                  if (audio) audio.muted = false;
+                }
+              }}
+              className={`${SLIDER_CLASS} w-16 sm:w-24`}
+              aria-label='音量'
+              title='音量'
+            />
+          </div>
+
+          {/* 倍速：服务端 -readrate（画面）+ atempo（声音） */}
           <button
             type='button'
-            onClick={toggleMute}
-            className='flex h-12 w-12 items-center justify-center rounded-full bg-white/15 text-white backdrop-blur'
-            aria-label={muted ? '取消静音' : '静音'}
+            className={controlBtn}
+            title='切换播放速度（会重新缓冲）'
+            aria-label='切换播放速度'
+            onClick={cycleRate}
           >
-            {muted ? <VolumeX className='h-6 w-6' /> : <Volume2 className='h-6 w-6' />}
+            {rate}×
           </button>
+
           {/* 音画校准：+ 声音提前，- 声音延后（改完自动重拉生效） */}
           <div
             className='flex items-center gap-1 rounded-full bg-white/10 px-2 py-1 backdrop-blur'
@@ -605,26 +957,17 @@ export default function TeslaCanvasPlayer({
               ＋
             </button>
           </div>
-          <div className='min-w-0 flex-1'>
-            <div className='truncate text-sm font-medium text-white'>
-              {title || 'Tesla 乘客画布播放'}
-            </div>
-            <div className='text-xs text-emerald-300/90'>
-              {isLive ? '直播' : '点播'} · 画布直收
-            </div>
-          </div>
+
+          <div className='min-w-0 flex-1' />
+
           {/* 清晰度：重启转码流生效 */}
           {!isLive && (
             <button
               type='button'
               className={controlBtn}
-              title='切换清晰度（会重新缓冲）'
+              title='切换清晰度（会重新缓冲，从当前位置继续）'
               aria-label='切换清晰度'
-              onClick={() => {
-                const idx = QUALITY_ORDER.indexOf(quality);
-                failCountRef.current = 0;
-                setQuality(QUALITY_ORDER[(idx + 1) % QUALITY_ORDER.length]);
-              }}
+              onClick={cycleQuality}
             >
               {dims.label}
             </button>
@@ -640,7 +983,7 @@ export default function TeslaCanvasPlayer({
                   : '去广告已关闭（点此开启并重新缓冲）'
               }
               aria-label='切换去广告'
-              onClick={() => setAdFilter((v) => !v)}
+              onClick={toggleAdFilter}
             >
               {adFilter ? (
                 <Shield className='h-4 w-4' />
@@ -652,8 +995,8 @@ export default function TeslaCanvasPlayer({
           )}
           <button
             type='button'
-            className='flex h-10 w-10 items-center justify-center rounded-full bg-white/15 text-white backdrop-blur'
-            title={isFullscreen ? '退出全屏' : '全屏'}
+            className={roundBtn}
+            title={isFullscreen ? '退出全屏' : '全屏（不支持原生全屏的设备自动用网页全屏）'}
             aria-label={isFullscreen ? '退出全屏' : '全屏'}
             onClick={toggleFullscreen}
           >
