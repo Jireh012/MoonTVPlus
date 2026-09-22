@@ -200,7 +200,7 @@ export default function TeslaCanvasPlayer({
       setError('');
       setPlaying(true);
 
-      if (!src || !canvasRef.current) return;
+      if (!src) return;
 
       try {
         const audioApi = `/api/tesla/audio?url=${encodeURIComponent(src)}`;
@@ -258,9 +258,11 @@ export default function TeslaCanvasPlayer({
         }
 
         if (playbackMode === 'webcodecs') {
+          const canvas = canvasRef.current;
+          if (!canvas) return;
           const player = startTeslaWebCodecs({
             src,
-            canvas: canvasRef.current,
+            canvas,
             audio: audioRef.current,
             onStarted: () => {
               if (!cancelled) setLoading(false);
