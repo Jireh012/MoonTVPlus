@@ -94,7 +94,12 @@ export function resolveMediaUrl(raw: string, requestOrigin: string): string {
   return unwrapped;
 }
 
-export type TeslaStreamKind = 'mpegts' | 'audio';
+export type TeslaStreamKind = 'mpegts' | 'audio' | 'mjpeg';
+
+const MJPEG_FPS = Math.max(8, Math.min(30, Number(process.env.MJPEG_FPS) || 18));
+const MJPEG_QUALITY = Math.max(2, Math.min(31, Number(process.env.MJPEG_QUALITY) || 6));
+const MJPEG_WIDTH = Math.max(320, Math.min(1920, Number(process.env.MJPEG_WIDTH) || 960));
+const MJPEG_HEIGHT = Math.max(180, Math.min(1080, Number(process.env.MJPEG_HEIGHT) || 544));
 
 function buildFfmpegArgs(kind: TeslaStreamKind, inputUrl: string): string[] {
   const hls = /\.m3u8?(\?|$)/i.test(inputUrl);
@@ -160,6 +165,25 @@ function buildFfmpegArgs(kind: TeslaStreamKind, inputUrl: string): string[] {
     ];
   }
 
+  if (kind === 'mjpeg') {
+    return [
+      ...beforeInput,
+      '-vf',
+      `scale=${MJPEG_WIDTH}:${MJPEG_HEIGHT}:force_original_aspect_ratio=decrease,pad=${MJPEG_WIDTH}:${MJPEG_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black`,
+      '-c:v',
+      'mjpeg',
+      '-q:v',
+      String(MJPEG_QUALITY),
+      '-r',
+      String(MJPEG_FPS),
+      '-f',
+      'image2pipe',
+      '-vframes',
+      '99999999',
+      'pipe:1',
+    ];
+  }
+
   return [
     ...beforeInput,
     '-vn',
@@ -175,6 +199,62 @@ function buildFfmpegArgs(kind: TeslaStreamKind, inputUrl: string): string[] {
     '128k',
     'pipe:1',
   ];
+}
+
+function findJpegMarker(
+  data: Uint8Array,
+  from: number,
+  a: number,
+  b: number
+): number {
+  for (let i = from; i < data.length - 1; i += 1) {
+    if (data[i] === 0xff && data[i + 1] === a) return i;
+    if (b >= 0 && data[i] === 0xff && data[i + 1] === b) return i;
+  }
+  return -1;
+}
+
+/**
+ * 把 ffmpeg image2pipe 输出的裸 JPEG 流封装成 multipart/x-mixed-replace。
+ * JPEG 熵编码区经 0xFF00 填充，FFD8(SOI)/FFD9(EOI) 只会出现在帧边界，可安全切分。
+ */
+export function createMjpegMultipartStream(): TransformStream<
+  Uint8Array,
+  Uint8Array
+> {
+  const header = (length: number) =>
+    new TextEncoder().encode(
+      `--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${length}\r\n\r\n`
+    );
+  const tail = new TextEncoder().encode('\r\n');
+  let buffer: Uint8Array = new Uint8Array(0);
+
+  return new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      const merged = new Uint8Array(buffer.length + chunk.length);
+      merged.set(buffer);
+      merged.set(chunk, buffer.length);
+      buffer = merged;
+
+      let cursor = 0;
+      for (;;) {
+        const soi = findJpegMarker(buffer, cursor, 0xd8, -1);
+        if (soi < 0) break;
+        const eoi = findJpegMarker(buffer, soi + 2, 0xd9, -1);
+        if (eoi < 0) break;
+        const frame = buffer.subarray(soi, eoi + 2);
+        try {
+          controller.enqueue(header(frame.length));
+          controller.enqueue(frame);
+          controller.enqueue(tail);
+        } catch {
+          return;
+        }
+        cursor = eoi + 2;
+      }
+      buffer = buffer.slice(cursor);
+    },
+  });
 }
 
 export function spawnTeslaFfmpeg(

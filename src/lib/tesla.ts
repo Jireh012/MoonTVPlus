@@ -11,7 +11,7 @@ const TESLA_BROWSER_UA = /Tesla|QtCarBrowser|TeslaBrowser/i;
 const TESLA_CHROMIUM_BUILD_UA =
   /X11;\s*Linux[^)]*\)[\s\S]*Chrome\/140\.0\.7339\.\d+/i;
 
-export type TeslaPlaybackMode = 'compat' | 'webcodecs';
+export type TeslaPlaybackMode = 'mjpeg' | 'compat' | 'webcodecs';
 
 export function isTeslaUserAgent(userAgent: string): boolean {
   return TESLA_BROWSER_UA.test(userAgent) || TESLA_CHROMIUM_BUILD_UA.test(userAgent);
@@ -56,20 +56,23 @@ export function isTeslaWebCodecsSupported(): boolean {
 }
 
 export function getTeslaPlaybackMode(): TeslaPlaybackMode {
-  if (typeof window === 'undefined') return 'compat';
+  if (typeof window === 'undefined') return 'mjpeg';
   try {
     const saved = localStorage.getItem(TESLA_PLAYBACK_MODE_KEY);
+    if (saved === 'mjpeg') return 'mjpeg';
     if (saved === 'webcodecs' && isTeslaWebCodecsSupported()) return 'webcodecs';
+    if (saved === 'compat') return 'compat';
   } catch {
     // ignore
   }
-  return 'compat';
+  // 默认极简 MJPEG：<img> 收 JPEG 帧流，不依赖 JS 定时器，D 档最抗冻结
+  return 'mjpeg';
 }
 
 export function setTeslaPlaybackMode(mode: TeslaPlaybackMode): void {
   if (typeof window === 'undefined') return;
   const next: TeslaPlaybackMode =
-    mode === 'webcodecs' && isTeslaWebCodecsSupported() ? 'webcodecs' : 'compat';
+    mode === 'webcodecs' && !isTeslaWebCodecsSupported() ? 'mjpeg' : mode;
   try {
     localStorage.setItem(TESLA_PLAYBACK_MODE_KEY, next);
   } catch {

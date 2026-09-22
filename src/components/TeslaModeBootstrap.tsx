@@ -70,7 +70,9 @@ export function TeslaPassengerBar({ className = '' }: TeslaPassengerBarProps) {
     window.addEventListener('moontv:tesla-passenger-mode', onMode);
     const onPlayback = (event: Event) => {
       const mode = (event as CustomEvent).detail?.mode;
-      setPlaybackMode(mode === 'webcodecs' ? 'webcodecs' : 'compat');
+      setPlaybackMode(
+        mode === 'webcodecs' || mode === 'mjpeg' ? mode : 'compat'
+      );
     };
     window.addEventListener('moontv:tesla-playback-mode', onPlayback);
     return () => {
@@ -94,6 +96,19 @@ export function TeslaPassengerBar({ className = '' }: TeslaPassengerBarProps) {
         </div>
         {enabled && (
           <div className='mt-2 flex gap-2'>
+            <button
+              type='button'
+              className={`rounded-lg px-2.5 py-1 text-xs font-bold ${
+                playbackMode === 'mjpeg' ? 'bg-white text-black' : 'bg-white/10 text-white'
+              }`}
+              title='JPEG 帧流直收，最抗 D 档冻结，需服务端 ffmpeg'
+              onClick={() => {
+                setTeslaPlaybackMode('mjpeg');
+                setPlaybackMode('mjpeg');
+              }}
+            >
+              极简
+            </button>
             <button
               type='button'
               className={`rounded-lg px-2.5 py-1 text-xs font-bold ${

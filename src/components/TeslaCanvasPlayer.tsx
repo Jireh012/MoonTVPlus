@@ -1,6 +1,6 @@
 'use client';
 
-import { Loader2, Pause, Play, Volume2, VolumeX } from 'lucide-react';
+import { Loader2, Pause, Play, RefreshCw, Volume2, VolumeX } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { getTeslaPlaybackMode, type TeslaPlaybackMode } from '@/lib/tesla';
@@ -130,12 +130,15 @@ export default function TeslaCanvasPlayer({
   onError,
 }: TeslaCanvasPlayerProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const playerRef = useRef<any>(null);
   const [loading, setLoading] = useState(true);
   const [playing, setPlaying] = useState(true);
   const [muted, setMuted] = useState(false);
   const [error, setError] = useState('');
+  const [needGesture, setNeedGesture] = useState(false);
+  const [streamNonce, setStreamNonce] = useState(0);
   const [playbackMode, setPlaybackMode] = useState<TeslaPlaybackMode>(() =>
     getTeslaPlaybackMode()
   );
@@ -144,7 +147,9 @@ export default function TeslaCanvasPlayer({
     setPlaybackMode(getTeslaPlaybackMode());
     const onMode = (event: Event) => {
       const mode = (event as CustomEvent).detail?.mode;
-      setPlaybackMode(mode === 'webcodecs' ? 'webcodecs' : 'compat');
+      setPlaybackMode(
+        mode === 'webcodecs' || mode === 'mjpeg' ? mode : 'compat'
+      );
     };
     window.addEventListener('moontv:tesla-playback-mode', onMode);
     return () => window.removeEventListener('moontv:tesla-playback-mode', onMode);
@@ -162,6 +167,12 @@ export default function TeslaCanvasPlayer({
       audio.pause();
       audio.removeAttribute('src');
       audio.load();
+    }
+    const img = imgRef.current;
+    if (img) {
+      img.onload = null;
+      img.onerror = null;
+      img.removeAttribute('src');
     }
   }, []);
 
@@ -187,6 +198,45 @@ export default function TeslaCanvasPlayer({
       try {
         const audioApi = `/api/tesla/audio?url=${encodeURIComponent(src)}`;
         const audio = audioRef.current;
+
+        // 极简 MJPEG：画面由 <img> 直接收 multipart JPEG 帧流，音频走独立 MP3 流。
+        // 不依赖任何 JS 定时器，浏览器原生收帧刷屏，是 D 档下最抗冻结的渲染路径。
+        if (playbackMode === 'mjpeg') {
+          const img = imgRef.current;
+          if (!img) return;
+          if (audio) {
+            audio.src = audioApi;
+            audio.muted = muted;
+          }
+          img.onload = () => {
+            if (cancelled) return;
+            setLoading(false);
+            if (audio) {
+              const playResult = audio.play();
+              if (playResult && typeof playResult.catch === 'function') {
+                playResult.catch(() => setNeedGesture(true));
+              }
+            }
+          };
+          img.onerror = () => {
+            if (cancelled) return;
+            const message = 'MJPEG 帧流加载失败，请确认服务端已安装 ffmpeg';
+            setError(message);
+            setLoading(false);
+            onError?.(message);
+          };
+          img.src = `/api/tesla/mjpeg?url=${encodeURIComponent(src)}`;
+          playerRef.current = {
+            destroy: () => {
+              img.onload = null;
+              img.onerror = null;
+              img.removeAttribute('src');
+              audio?.pause();
+            },
+          };
+          return;
+        }
+
         if (playbackMode === 'webcodecs' && audio) {
           audio.src = audioApi;
           audio.muted = muted;
@@ -343,11 +393,22 @@ export default function TeslaCanvasPlayer({
       stopJsmpegLoop();
       cleanup();
     };
-    // muted 不重拉流，仅在按钮里改 audio.muted
+    // muted 不重拉流，仅在按钮里改 audio.muted；streamNonce 用于「重新同步」
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [src, cleanup, onError, playbackMode]);
+  }, [src, cleanup, onError, playbackMode, streamNonce]);
+
+  // 极简模式下画面流不可暂停，播放键改为「重新同步」：重拉两条流让音画回到同一起点
+  const resync = () => {
+    setNeedGesture(false);
+    setLoading(true);
+    setStreamNonce((n) => n + 1);
+  };
 
   const togglePlay = () => {
+    if (playbackMode === 'mjpeg') {
+      resync();
+      return;
+    }
     const player = playerRef.current;
     const audio = audioRef.current;
     if (!player) return;
@@ -397,14 +458,40 @@ export default function TeslaCanvasPlayer({
           style={{ backgroundImage: `url(${poster})` }}
         />
       )}
-      <canvas
-        key={playbackMode}
-        ref={canvasRef}
-        className='h-full w-full object-contain'
-        width={960}
-        height={544}
-      />
+      {playbackMode === 'mjpeg' ? (
+        <img
+          key={streamNonce}
+          ref={imgRef}
+          alt=''
+          className='h-full w-full object-contain'
+        />
+      ) : (
+        <canvas
+          key={playbackMode}
+          ref={canvasRef}
+          className='h-full w-full object-contain'
+          width={960}
+          height={544}
+        />
+      )}
       <audio ref={audioRef} preload='auto' playsInline />
+
+      {needGesture && !error && (
+        <button
+          type='button'
+          className='absolute inset-0 z-30 flex items-center justify-center bg-black/70 text-lg font-semibold text-white'
+          onClick={() => {
+            const playResult = audioRef.current?.play();
+            if (playResult && typeof playResult.then === 'function') {
+              playResult.then(() => setNeedGesture(false)).catch(() => undefined);
+            } else {
+              setNeedGesture(false);
+            }
+          }}
+        >
+          点击开始播放
+        </button>
+      )}
 
       {(loading || error) && (
         <div className='absolute inset-0 z-10 flex items-center justify-center bg-black/70 px-6 text-center'>
@@ -419,7 +506,9 @@ export default function TeslaCanvasPlayer({
               <span>
                 {playbackMode === 'webcodecs'
                   ? '正在用 WebCodecs 解码原画…'
-                  : '正在转码为 Tesla 可用画面…'}
+                  : playbackMode === 'mjpeg'
+                    ? '正在接收 JPEG 帧流…'
+                    : '正在转码为 Tesla 可用画面…'}
               </span>
             </div>
           )}
@@ -432,9 +521,16 @@ export default function TeslaCanvasPlayer({
             type='button'
             onClick={togglePlay}
             className='flex h-12 w-12 items-center justify-center rounded-full bg-white/15 text-white backdrop-blur'
-            aria-label={playing ? '暂停' : '播放'}
+            aria-label={playbackMode === 'mjpeg' ? '重新同步' : playing ? '暂停' : '播放'}
+            title={playbackMode === 'mjpeg' ? '音画不同步时点此重新同步' : undefined}
           >
-            {playing ? <Pause className='h-6 w-6' /> : <Play className='h-6 w-6' />}
+            {playbackMode === 'mjpeg' ? (
+              <RefreshCw className='h-6 w-6' />
+            ) : playing ? (
+              <Pause className='h-6 w-6' />
+            ) : (
+              <Play className='h-6 w-6' />
+            )}
           </button>
           <button
             type='button'
@@ -449,7 +545,12 @@ export default function TeslaCanvasPlayer({
               {title || 'Tesla 乘客画布播放'}
             </div>
             <div className='text-xs text-emerald-300/90'>
-              {isLive ? '直播' : '点播'} · {playbackMode === 'webcodecs' ? '高清 WebCodecs' : '兼容转码'}
+              {isLive ? '直播' : '点播'} ·{' '}
+              {playbackMode === 'webcodecs'
+                ? '高清 WebCodecs'
+                : playbackMode === 'mjpeg'
+                  ? '极简 MJPEG'
+                  : '兼容转码'}
             </div>
           </div>
         </div>
