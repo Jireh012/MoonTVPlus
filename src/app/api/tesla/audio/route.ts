@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getAuthInfoFromCookie } from '@/lib/auth';
 import {
   createFfmpegReadableStream,
+  parseStartSeconds,
   resolveFfmpegPath,
   resolveMediaUrl,
 } from '@/lib/tesla-stream';
@@ -33,7 +34,8 @@ export async function GET(request: NextRequest) {
     const stream = createFfmpegReadableStream(
       'audio',
       inputUrl,
-      request.signal
+      request.signal,
+      parseStartSeconds(request.nextUrl.searchParams.get('start'))
     );
 
     return new Response(stream, {

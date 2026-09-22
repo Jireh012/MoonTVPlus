@@ -1,5 +1,4 @@
 const TESLA_PASSENGER_MODE_KEY = 'moontv_tesla_passenger_mode';
-const TESLA_PLAYBACK_MODE_KEY = 'moontv_tesla_playback_mode';
 const TESLA_FORCE_KEY = 'moontv_force_tesla';
 
 /**
@@ -10,8 +9,6 @@ const TESLA_FORCE_KEY = 'moontv_force_tesla';
 const TESLA_BROWSER_UA = /Tesla|QtCarBrowser|TeslaBrowser/i;
 const TESLA_CHROMIUM_BUILD_UA =
   /X11;\s*Linux[^)]*\)[\s\S]*Chrome\/140\.0\.7339\.\d+/i;
-
-export type TeslaPlaybackMode = 'mjpeg' | 'compat' | 'webcodecs';
 
 export function isTeslaUserAgent(userAgent: string): boolean {
   return TESLA_BROWSER_UA.test(userAgent) || TESLA_CHROMIUM_BUILD_UA.test(userAgent);
@@ -48,39 +45,6 @@ export function getTeslaPassengerMode(): boolean {
   }
   // 默认：检测到 Tesla 时开启乘客模式
   return isTeslaBrowser();
-}
-
-export function isTeslaWebCodecsSupported(): boolean {
-  if (typeof window === 'undefined') return false;
-  return typeof (window as Window & { VideoDecoder?: unknown }).VideoDecoder === 'function';
-}
-
-export function getTeslaPlaybackMode(): TeslaPlaybackMode {
-  if (typeof window === 'undefined') return 'mjpeg';
-  try {
-    const saved = localStorage.getItem(TESLA_PLAYBACK_MODE_KEY);
-    if (saved === 'mjpeg') return 'mjpeg';
-    if (saved === 'webcodecs' && isTeslaWebCodecsSupported()) return 'webcodecs';
-    if (saved === 'compat') return 'compat';
-  } catch {
-    // ignore
-  }
-  // 默认极简 MJPEG：<img> 收 JPEG 帧流，不依赖 JS 定时器，D 档最抗冻结
-  return 'mjpeg';
-}
-
-export function setTeslaPlaybackMode(mode: TeslaPlaybackMode): void {
-  if (typeof window === 'undefined') return;
-  const next: TeslaPlaybackMode =
-    mode === 'webcodecs' && !isTeslaWebCodecsSupported() ? 'mjpeg' : mode;
-  try {
-    localStorage.setItem(TESLA_PLAYBACK_MODE_KEY, next);
-  } catch {
-    // ignore
-  }
-  window.dispatchEvent(
-    new CustomEvent('moontv:tesla-playback-mode', { detail: { mode: next } })
-  );
 }
 
 export function setTeslaPassengerMode(enabled: boolean): void {
@@ -273,11 +237,7 @@ export function shouldPreferTeslaCanvasPlayback(): boolean {
 }
 
 export async function fetchTeslaCanvasAvailability(): Promise<boolean> {
-  // 高清 WebCodecs 模式直接解 HLS 原流，不依赖服务端 ffmpeg，
-  // 同样能绕过 D 档对 <video> 的画面冻结。
-  if (getTeslaPlaybackMode() === 'webcodecs' && isTeslaWebCodecsSupported()) {
-    return true;
-  }
+  // 画布播放只有极简 MJPEG 一条路，依赖服务端 ffmpeg 做转码
   try {
     const response = await fetch('/api/tesla/status', {
       credentials: 'same-origin',

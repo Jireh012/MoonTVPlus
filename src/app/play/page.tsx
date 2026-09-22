@@ -1926,6 +1926,10 @@ function PlayPageClient() {
 
   // 用于记录是否需要在播放器 ready 后跳转到指定进度
   const resumeTimeRef = useRef<number | null>(null);
+  // Tesla 画布模式没有 Artplayer，进度由 TeslaCanvasPlayer.onProgress 上报到这里，
+  // 保存播放记录时作为 currentTime/duration 的兜底来源
+  const teslaProgressRef = useRef({ current: 0, duration: 0 });
+  const teslaLastSaveAtRef = useRef(0);
   // 切换鸿蒙 HLS 内核时，同时恢复切换前的播放/暂停状态。
   const resumePlayingAfterHlsModeSwitchRef = useRef<boolean | null>(null);
   // 播放记录跳转按钮状态
@@ -6703,7 +6707,6 @@ function PlayPageClient() {
   // 保存播放进度
   const saveCurrentPlayProgress = async () => {
     if (
-      !artPlayerRef.current ||
       !currentSourceRef.current ||
       !currentIdRef.current ||
       !videoTitleRef.current ||
@@ -6712,9 +6715,14 @@ function PlayPageClient() {
       return;
     }
 
+    // Tesla 画布模式没有 Artplayer，用播放器上报的进度兜底
     const player = artPlayerRef.current;
-    const currentTime = player.currentTime || 0;
-    const duration = player.duration || 0;
+    const currentTime = player
+      ? player.currentTime || 0
+      : teslaProgressRef.current.current;
+    const duration = player
+      ? player.duration || 0
+      : teslaProgressRef.current.duration;
     const playTime = Math.floor(currentTime);
 
     // 如果播放时间太短（少于5秒）或者视频时长无效，不保存
@@ -6930,11 +6938,9 @@ function PlayPageClient() {
       void refreshTeslaCanvasMode();
     };
     window.addEventListener('moontv:tesla-passenger-mode', onMode);
-    window.addEventListener('moontv:tesla-playback-mode', onMode);
     return () => {
       cancelled = true;
       window.removeEventListener('moontv:tesla-passenger-mode', onMode);
-      window.removeEventListener('moontv:tesla-playback-mode', onMode);
     };
   }, []);
 
@@ -10380,7 +10386,30 @@ function PlayPageClient() {
                     title={videoTitle || undefined}
                     isLive={false}
                     poster={videoCover || undefined}
+                    autoPlay={false}
+                    startTime={resumeTimeRef.current || 0}
+                    sourceName={currentSourceRef.current || undefined}
                     onError={(message) => setError(message)}
+                    /* Tesla 画布模式没有 Artplayer 的 ready/playing 事件，
+                       必须靠播放器自身的就绪回调收起加载蒙层 */
+                    onReady={() => {
+                      setIsVideoLoading(false);
+                      setVideoError(null);
+                      setCorsFailedUrl(null);
+                    }}
+                    /* Tesla 模式没有 Artplayer 的 timeupdate，进度靠这里上报，
+                       节流后写播放记录（页面隐藏/卸载时也会经 saveCurrentPlayProgress 落盘） */
+                    onProgress={(current, dur) => {
+                      teslaProgressRef.current = { current, duration: dur };
+                      const now = Date.now();
+                      if (
+                        current >= 1 &&
+                        now - teslaLastSaveAtRef.current >= 10_000
+                      ) {
+                        teslaLastSaveAtRef.current = now;
+                        void saveCurrentPlayProgress();
+                      }
+                    }}
                   />
                 ) : (
                   <div
@@ -10389,8 +10418,11 @@ function PlayPageClient() {
                   ></div>
                 )}
 
-                {/* 换源加载蒙层 */}
-                {(isVideoLoading || videoError) && (
+                {/* 换源加载蒙层。
+                    Tesla 画布模式不走这里：autoPlay=false 时播放器先显示「点击开始播放」，
+                    若这层 z-[500] 的蒙层盖着，用户永远点不到起播按钮；
+                    Tesla 自己的加载/错误态由 TeslaCanvasPlayer 内部蒙层展示 */}
+                {(isVideoLoading || videoError) && !teslaCanvasActive && (
                   <div className='absolute inset-0 bg-black/85 backdrop-blur-sm rounded-xl flex items-center justify-center z-[500] transition-all duration-300'>
                     <div className='text-center max-w-md mx-auto px-6'>
                       {videoError ? (

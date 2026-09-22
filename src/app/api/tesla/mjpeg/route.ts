@@ -4,6 +4,8 @@ import { getAuthInfoFromCookie } from '@/lib/auth';
 import {
   createFfmpegReadableStream,
   createMjpegMultipartStream,
+  parseQuality,
+  parseStartSeconds,
   resolveFfmpegPath,
   resolveMediaUrl,
 } from '@/lib/tesla-stream';
@@ -40,7 +42,9 @@ export async function GET(request: NextRequest) {
     const jpegStream = createFfmpegReadableStream(
       'mjpeg',
       inputUrl,
-      request.signal
+      request.signal,
+      parseStartSeconds(request.nextUrl.searchParams.get('start')),
+      parseQuality(request.nextUrl.searchParams.get('q'))
     );
     const stream = jpegStream.pipeThrough(createMjpegMultipartStream());
 
